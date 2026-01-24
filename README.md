@@ -11,20 +11,19 @@ A GUI tool that downloads missing ROMs from Myrient to complete your game collec
 - 📥 **Built-in DAT Downloader** — Download fresh 1G1R DATs directly from [Fresh1G1R](https://github.com/UnluckyForSome/Fresh1G1R) to ensure you're getting the latest 1G1R sets.
 - 🔧 **IGIR Integration** — Optionally use [IGIR](https://github.com/emmercm/igir) to scan your existing collection to ensure a perfect set of games every time.
 
----
-
 ## 🚀 Getting Started
 
 ### Option 1: Standalone Executable
 
 > ⚠️ As a general rule, you should **never blindly run `.exe` files from GitHub (or anywhere else)**. Only run executables if you trust the source and understand the risks.
 
-For convenience, a prebuilt `MyrientCanFixDAT.exe` is provided in the Releases section. It is **generated directly from this repository's Python source using PyInstaller**, which bundles the app and Python runtime into a single executable.
+For convenience, a prebuilt [`MyrientCanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/MyrientCanFixDAT.exe) is provided in the Releases section. It is **generated directly from this repository's Python source using PyInstaller**, which bundles the app and Python runtime into a single executable.
 
 🔍 You can review the source used to build the executable here: [`MyrientCanFixDAT.py`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/blob/main/MyrientCanFixDAT.py).
 
+
 **Steps:**
-1. 📦 Download `MyrientCanFixDAT.exe` from the **Releases** page  
+1. 📦 Download [`MyrientCanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/MyrientCanFixDAT.exe) from the **Releases** page  
 2. ▶️ Run the `.exe` — required directories will be created alongside it  
 3. ⚙️ Configure your paths and click **Run**
 
