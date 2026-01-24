@@ -1,5 +1,9 @@
 # 🎮 Myrient Can FixDAT
 
+> ⚠️ **v1.0.0 Disclaimer**  
+> This project started as a personal tool I made for myself and later decided to develop and share. While it works well for my use cases, it may not be free of bugs, edge cases, or unexpected behavior. Use it at your own risk, double-check results, and always keep backups of your data and ROM collections!
+
+
 A GUI tool that downloads missing ROMs from Myrient to complete your game collection. Point it at your existing ROMs, give it a DAT file describing your desired collection, and it will download only what you're missing. Includes automatic download of the latest daily [Fresh1G1R](https://github.com/UnluckyForSome/Fresh1G1R) DATs.
 
 ![Myrient Can FixDAT Screenshot](.github/MyrientCanFixDat.PNG)
