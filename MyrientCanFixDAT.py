@@ -2402,7 +2402,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ff = url_label.font()
         ff.setBold(True)
         url_label.setFont(ff)
-        url_subtitle = QtWidgets.QLabel("(ROMS? What ROMS?)")
+        url_subtitle = QtWidgets.QLabel("(i'm innocent, i tells ya!)")
         url_subtitle.setStyleSheet("color: gray; font-size: 10px;")
 
         url_label_layout = QtWidgets.QVBoxLayout()
@@ -2831,7 +2831,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _browse_roms(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select ROMs directory", str(Path.cwd()))
         if path:
-            self.roms_edit.setText(normalize_path_display(path))
+            normalized = normalize_path_display(path)
+            self.roms_edit.setText(normalized)
+            # Auto-fill downloads directory if empty
+            if not self.downloads_edit.text().strip():
+                self.downloads_edit.setText(normalized)
+                self._validate_field("downloads")
 
     def _browse_downloads(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select downloads directory", str(Path.cwd()))
