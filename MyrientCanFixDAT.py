@@ -794,8 +794,14 @@ def check_fixdat_setup() -> Tuple[bool, Optional[Path]]:
     return False, None
 
 
-def validate_config(has_manual_fixdat: bool, manual_fixdat: Optional[Path]) -> Tuple[bool, Optional[str]]:
-    """Validate all configuration paths and URLs. Returns (success, myrient_url)."""
+def validate_config(
+    has_manual_fixdat: bool,
+    manual_fixdat: Optional[Path],
+    require_igir: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    """Validate all configuration paths and URLs. Returns (success, myrient_url).
+    When require_igir is False (e.g. 'Use IGIR' is off and clean_roms is off),
+    a missing IGIR executable is not treated as an error."""
     errors: List[str] = []
     warnings: List[str] = []
     config_info: List[Tuple[str, str, str]] = []
@@ -817,8 +823,10 @@ def validate_config(has_manual_fixdat: bool, manual_fixdat: Optional[Path]) -> T
     igir_exe, igir_valid, igir_error = validate_file_path(CONFIG.igir_exe, "IGIR executable")
     if igir_valid:
         config_info.append(("🔧 IGIR Executable", str(igir_exe), "✅ Found"))
-    else:
+    elif require_igir:
         errors.append(igir_error)
+    else:
+        config_info.append(("🔧 IGIR Executable", str(igir_exe) if igir_exe else "—", "⚠️  Not required (skipped)"))
 
     roms_dir, roms_valid, roms_error = validate_directory_path(CONFIG.roms_directory, "ROMs directory")
     if roms_valid:
@@ -1925,9 +1933,10 @@ class DownloadWorker(QtCore.QThread):
         original_auto = CONFIG.auto_config_yes
         CONFIG.auto_config_yes = True
 
+        require_igir = self._use_igir or CONFIG.clean_roms
         stdout_capture = io.StringIO()
         with contextlib.redirect_stdout(stdout_capture):
-            config_valid, myrient_url = validate_config(has_manual_fixdat, manual_fixdat)
+            config_valid, myrient_url = validate_config(has_manual_fixdat, manual_fixdat, require_igir=require_igir)
 
         CONFIG.auto_config_yes = original_auto
         self._emit_log_lines(stdout_capture.getvalue())
