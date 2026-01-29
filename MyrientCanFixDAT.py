@@ -27,7 +27,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 # Third-party imports
 import requests
@@ -109,9 +109,14 @@ FRESH1G1R_REPO = "UnluckyForSome/Fresh1G1R"
 DAILY_1G1R_PATH = "daily-1g1r-dat"
 GITHUB_API_BASE = "https://api.github.com/repos"
 
-# Collection types
+# RetroAchievements DATs (Unofficial-RA-DATs)
+RA_DAT_REPO = "UltraGodAzgorath/Unofficial-RA-DATs"
+RA_DAT_PATH = "DATs/RetroAchievements (No Subfolders)"
+
+# Collection types (for Myrient path inference)
 COLLECTION_NO_INTRO = "No-Intro"
 COLLECTION_REDUMP = "Redump"
+COLLECTION_RETRO_ACHIEVEMENTS = "RetroAchievements"
 
 # Error messages
 ERROR_CONFIG_VALIDATION = "Configuration validation failed. Please check the log."
@@ -1594,13 +1599,23 @@ def infer_myrient_url_from_dat(dat_path: Path, base_url: str) -> Optional[str]:
             return None
 
         name_elem = header.find("name")
-        url_elem = header.find("url")
         if name_elem is None or not (name_elem.text or "").strip():
-            return None
-        if url_elem is None or not (url_elem.text or "").strip():
             return None
 
         system_name = (name_elem.text or "").strip()
+
+        # RetroAchievements: identify by <homepage>https://retroachievements.org/</homepage>
+        homepage_elem = header.find("homepage")
+        if homepage_elem is not None and (homepage_elem.text or "").strip():
+            homepage = (homepage_elem.text or "").strip()
+            if "retroachievements.org" in homepage:
+                encoded_name = urllib.parse.quote(system_name, safe="")
+                return f"{base_url.rstrip('/')}/files/{COLLECTION_RETRO_ACHIEVEMENTS}/{encoded_name}/"
+
+        url_elem = header.find("url")
+        if url_elem is None or not (url_elem.text or "").strip():
+            return None
+
         dat_url = (url_elem.text or "").strip().lower()
 
         if "redump.org" in dat_url:
@@ -2361,6 +2376,7 @@ class MainWindow(QtWidgets.QMainWindow):
         paths_layout.addWidget(self.dat_edit, row, 1)
 
         dat_buttons_container = QtWidgets.QWidget()
+        dat_buttons_container.setMinimumWidth(200)
         dat_buttons_layout = QtWidgets.QHBoxLayout(dat_buttons_container)
         dat_buttons_layout.setContentsMargins(0, 0, 0, 0)
         dat_buttons_layout.setSpacing(6)
@@ -2368,10 +2384,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dat_browse_btn = QtWidgets.QPushButton("Browse")
         dat_browse_btn.clicked.connect(self._browse_dat)
 
-        self.download_dat_button = QtWidgets.QPushButton("Download 1G1R")
-        self.download_dat_button.clicked.connect(self._on_download_dat_clicked)
+        self.download_fresh1g1r_button = QtWidgets.QPushButton("Fresh 1G1R")
+        self.download_fresh1g1r_button.clicked.connect(self._on_download_fresh1g1r_clicked)
 
-        dat_buttons_layout.addWidget(self.download_dat_button)
+        self.download_ra_button = QtWidgets.QPushButton("RetroAchievements")
+        self.download_ra_button.clicked.connect(self._on_download_retroachievements_clicked)
+
+        dat_buttons_layout.addWidget(self.download_fresh1g1r_button)
+        dat_buttons_layout.addWidget(self.download_ra_button)
         dat_buttons_layout.addWidget(dat_browse_btn)
 
         paths_layout.addWidget(dat_buttons_container, row, 2)
@@ -2396,6 +2416,7 @@ class MainWindow(QtWidgets.QMainWindow):
             label_container.setLayout(label_layout)
 
             browse_btn = QtWidgets.QPushButton("Browse")
+            browse_btn.setMinimumWidth(200)
             browse_btn.clicked.connect(browse_slot)
 
             paths_layout.addWidget(label_container, row, 0)
@@ -2842,18 +2863,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             normalized = normalize_path_display(path)
             self.roms_edit.setText(normalized)
-            # Auto-fill downloads directory if empty
-            if not self.downloads_edit.text().strip():
-                self.downloads_edit.setText(normalized)
-                self._validate_field("downloads")
+            self.downloads_edit.setText(normalized)
+            self._validate_field("downloads")
 
     def _browse_downloads(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select downloads directory", str(Path.cwd()))
         if path:
             self.downloads_edit.setText(normalize_path_display(path))
 
-    def _on_download_dat_clicked(self) -> None:
-        dialog = DatDownloadDialog(self)
+    def _on_download_fresh1g1r_clicked(self) -> None:
+        dialog = DatDownloadDialog(self, mode="fresh1g1r")
+        if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.selected_dat_path:
+            self.dat_edit.setText(normalize_path_display(str(dialog.selected_dat_path)))
+            self._validate_field("dat")
+
+    def _on_download_retroachievements_clicked(self) -> None:
+        dialog = DatDownloadDialog(self, mode="retroachievements")
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.selected_dat_path:
             self.dat_edit.setText(normalize_path_display(str(dialog.selected_dat_path)))
             self._validate_field("dat")
@@ -3142,11 +3167,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 class DatDownloadDialog(QtWidgets.QDialog):
-    """Dialog to select and download DAT files from the Fresh1G1R GitHub repo."""
+    """Dialog to select and download DAT files from Fresh1G1R or RetroAchievements GitHub repos."""
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        mode: Literal["fresh1g1r", "retroachievements"] = "fresh1g1r",
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Download DAT from Fresh1G1R")
+        self._mode = mode
+        self.setWindowTitle("Download DAT from RetroAchievements" if mode == "retroachievements" else "Download DAT from Fresh 1G1R")
         self.resize(650, 550)
 
         self.setWindowFlags(
@@ -3178,11 +3208,28 @@ class DatDownloadDialog(QtWidgets.QDialog):
         content_layout.setSpacing(8)
         layout.addWidget(content)
 
-        info = QtWidgets.QLabel(
-            "DATs are pulled from the daily updated 1G1R sets at: github.com/UnluckyForSome/Fresh1G1R"
+        _link_style = 'style="color: #88b0dc; text-decoration: none;"'
+        self.info_label = QtWidgets.QLabel(
+            f'DATs from Unofficial RetroAchievements sets: <a href="https://github.com/UltraGodAzgorath/Unofficial-RA-DATs" {_link_style}>github.com/UltraGodAzgorath/Unofficial-RA-DATs</a>'
+            if mode == "retroachievements"
+            else f'DATs are pulled from the daily updated 1G1R sets at: <a href="https://github.com/UnluckyForSome/Fresh1G1R" {_link_style}>github.com/UnluckyForSome/Fresh1G1R</a>'
         )
-        info.setStyleSheet("color: gray; font-size: 10px;")
-        content_layout.addWidget(info)
+        self.info_label.setStyleSheet(
+            "color: gray; font-size: 10px;"
+            " QLabel a { color: #88b0dc; }"
+        )
+        self.info_label.setTextFormat(QtCore.Qt.RichText)
+        self.info_label.setOpenExternalLinks(True)
+        content_layout.addWidget(self.info_label)
+
+        if mode == "retroachievements":
+            self.ra_disclaimer_label = QtWidgets.QLabel(
+                "This app has no control over this repo — DATs may be out of date or unsuitable."
+            )
+            self.ra_disclaimer_label.setStyleSheet("color: #a85858; font-size: 10px;")
+            content_layout.addWidget(self.ra_disclaimer_label)
+        else:
+            self.ra_disclaimer_label = None
 
         selectors = QtWidgets.QWidget()
         selectors_layout = QtWidgets.QHBoxLayout(selectors)
@@ -3251,6 +3298,7 @@ class DatDownloadDialog(QtWidgets.QDialog):
         selectors_layout.setStretch(0, 1)
         selectors_layout.setStretch(1, 1)
         content_layout.addWidget(selectors)
+        selectors.setVisible(self._mode == "fresh1g1r")
 
         list_group = QtWidgets.QGroupBox("Select DAT File")
         list_vbox = QtWidgets.QVBoxLayout(list_group)
@@ -3317,11 +3365,14 @@ class DatDownloadDialog(QtWidgets.QDialog):
         self.dat_list.addItem("Loading...")
         self._dat_files = []
 
-        selected_type = self._current_type()
-        selected_source = self._current_source()
-        folder_path = f"{DAILY_1G1R_PATH}/{selected_source}/{selected_type}"
-
-        api_url = f"{GITHUB_API_BASE}/{FRESH1G1R_REPO}/contents/{folder_path}"
+        if self._mode == "retroachievements":
+            folder_path = RA_DAT_PATH
+            api_url = f"{GITHUB_API_BASE}/{RA_DAT_REPO}/contents/{urllib.parse.quote(folder_path, safe='/')}"
+        else:
+            selected_type = self._current_type()
+            selected_source = self._current_source()
+            folder_path = f"{DAILY_1G1R_PATH}/{selected_source}/{selected_type}"
+            api_url = f"{GITHUB_API_BASE}/{FRESH1G1R_REPO}/contents/{folder_path}"
 
         try:
             resp = requests.get(api_url, timeout=DEFAULT_TIMEOUT)
