@@ -1459,8 +1459,10 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
     return files
 
 
-def fetch_myrient_index(system_url: str) -> Optional[List[Dict[str, object]]]:
-    """Download and parse Myrient directory listing."""
+def fetch_myrient_index(system_url: str) -> Tuple[Optional[List[Dict[str, object]]], Optional[str]]:
+    """Download and parse Myrient directory listing.
+    Returns (files, None) on success, or (None, error_type) on failure.
+    error_type is '404', 'timeout', 'connection', 'http', or 'error' for other failures."""
     print("\n" + "=" * 70)
     print("🌐 Downloading Myrient directory metadata...")
     print("=" * 70)
@@ -1471,19 +1473,21 @@ def fetch_myrient_index(system_url: str) -> Optional[List[Dict[str, object]]]:
         resp.raise_for_status()
         files = _parse_myrient_listing_html(resp.text, system_url)
         print(f"📁 Found {len(files)} files in Myrient directory")
-        return files
+        return files, None
     except requests.Timeout:
         print(f"❌ Timeout fetching Myrient index: {system_url}")
-        return None
+        return None, "timeout"
     except requests.ConnectionError:
         print(f"❌ Connection error fetching Myrient index: {system_url}")
-        return None
+        return None, "connection"
     except requests.HTTPError as e:
         print(f"❌ HTTP error fetching Myrient index: {e}")
-        return None
+        if e.response is not None and e.response.status_code == 404:
+            return None, "404"
+        return None, "http"
     except Exception as e:  # noqa: BLE001
         print(f"❌ Unexpected error fetching Myrient index: {e}")
-        return None
+        return None, "error"
 
 
 def standardize_game_entry(game: Dict[str, str]) -> Dict[str, str]:
@@ -1892,6 +1896,16 @@ class TitleBar(QtWidgets.QWidget):
         super().mouseReleaseEvent(event)
 
 
+class _MyrientOverrideReceiver(QtCore.QObject):
+    """Lives in worker thread; receives override URL from main window and quits the worker's event loop."""
+
+    @QtCore.pyqtSlot(str)
+    def set_override_url(self, url: str) -> None:
+        if hasattr(self, "_worker") and hasattr(self, "_event_loop"):
+            self._worker._override_url_result = url  # type: ignore[attr-defined]
+            self._event_loop.quit()
+
+
 class DownloadWorker(QtCore.QThread):
     """Runs the full workflow for the Qt GUI."""
 
@@ -1900,6 +1914,7 @@ class DownloadWorker(QtCore.QThread):
     finished_signal = QtCore.pyqtSignal()
     error_signal = QtCore.pyqtSignal(str)
     log_signal = QtCore.pyqtSignal(str)
+    request_myrient_url_override = QtCore.pyqtSignal(str)  # emitted on 404; main window shows dialog and emits result back
 
     def __init__(self, config_snapshot: dict, use_igir: bool, parent=None) -> None:
         super().__init__(parent)
@@ -2059,7 +2074,7 @@ class DownloadWorker(QtCore.QThread):
         return games
 
     def _fetch_myrient_index(self, myrient_url: str) -> Optional[List[Dict[str, object]]]:
-        """Fetch Myrient index and return it."""
+        """Fetch Myrient index and return it. On 404, ask user for full Myrient URL and retry."""
         import contextlib
         import io
 
@@ -2068,8 +2083,28 @@ class DownloadWorker(QtCore.QThread):
 
         stdout_capture = io.StringIO()
         with contextlib.redirect_stdout(stdout_capture):
-            myrient_index = fetch_myrient_index(myrient_url)
+            myrient_index, error_type = fetch_myrient_index(myrient_url)
         self._emit_log_lines(stdout_capture.getvalue())
+
+        if error_type == "404":
+            main_win = self.parent()
+            if main_win is not None and hasattr(main_win, "myrient_override_result_signal"):
+                event_loop = QtCore.QEventLoop()
+                self._override_url_result = None  # type: ignore[attr-defined]
+                receiver = _MyrientOverrideReceiver(self)
+                receiver._worker = self  # type: ignore[attr-defined]
+                receiver._event_loop = event_loop  # type: ignore[attr-defined]
+                main_win.myrient_override_result_signal.connect(receiver.set_override_url)
+                self.request_myrient_url_override.emit(myrient_url)
+                event_loop.exec_()
+                main_win.myrient_override_result_signal.disconnect(receiver.set_override_url)
+                override_url = (self._override_url_result or "").strip()  # type: ignore[attr-defined]
+                if override_url:
+                    self.log_signal.emit("\n🔄 Retrying with user-provided URL...")
+                    stdout_capture = io.StringIO()
+                    with contextlib.redirect_stdout(stdout_capture):
+                        myrient_index, error_type = fetch_myrient_index(override_url)
+                    self._emit_log_lines(stdout_capture.getvalue())
 
         if not myrient_index:
             self.error_signal.emit(ERROR_MYRIENT_INDEX_FAILED)
@@ -2304,6 +2339,8 @@ class DownloadWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    myrient_override_result_signal = QtCore.pyqtSignal(str)  # emitted with override URL when user provides it (from 404 dialog)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Myrient Can FixDAT")
@@ -2962,6 +2999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.log_signal.connect(self.append_log)
         worker.error_signal.connect(self._on_mcfd_error)
         worker.finished_signal.connect(self._on_worker_finished)
+        worker.request_myrient_url_override.connect(self._on_request_myrient_url_override)
         worker.start()
 
     @QtCore.pyqtSlot(object, object, str, str, str, str)
@@ -3024,6 +3062,89 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.addButton(QtWidgets.QMessageBox.Ok)
 
         dialog.exec_()
+
+    @QtCore.pyqtSlot(str)
+    def _on_request_myrient_url_override(self, failed_url: str) -> None:
+        """Show dialog asking for full Myrient URL when worker got 404; emit result so worker can retry."""
+        url = self._show_myrient_url_override_dialog(failed_url)
+        self.myrient_override_result_signal.emit(url)
+
+    def _show_myrient_url_override_dialog(self, failed_url: str) -> str:
+        """Show a dialog asking for the full Myrient URL when inferred URL returned 404.
+        Returns the URL string if user clicks OK, or empty string if cancelled."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Myrient URL Not Found (404)")
+        dialog.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.Dialog
+            | QtCore.Qt.WindowSystemMenuHint
+        )
+        dialog.resize(520, 220)
+
+        palette = dialog.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(42, 43, 51))
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor(42, 43, 51))
+        dialog.setPalette(palette)
+        dialog.setAutoFillBackground(True)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # Title bar (match DatDownloadDialog style)
+        title_bar = QtWidgets.QWidget(dialog)
+        title_bar.setObjectName("titleBar")
+        title_bar.setFixedHeight(TITLE_BAR_HEIGHT)
+        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(10, 4, 8, 4)
+        title_layout.setSpacing(8)
+        title_label = QtWidgets.QLabel("Myrient URL Not Found (404)")
+        title_label.setObjectName("titleText")
+        title_layout.addWidget(title_label)
+        title_layout.addStretch(1)
+        close_btn = QtWidgets.QPushButton("×")
+        close_btn.setObjectName("titleButtonClose")
+        close_btn.setFixedSize(28, 22)
+        close_btn.clicked.connect(dialog.reject)
+        title_layout.addWidget(close_btn)
+        layout.addWidget(title_bar)
+
+        # Content panel
+        content = QtWidgets.QWidget(dialog)
+        content.setObjectName("dialogPanel")
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(8)
+        layout.addWidget(content)
+
+        msg = QtWidgets.QLabel(
+            "The inferred Myrient URL doesn't seem to exist... Myrient is either down, or more likely the system you are looking for is in a different folder name that we can't infer from the DAT. This is normal for some specific systems.\n\nIn this case, please enter the full Myrient URL to the game directory:"
+        )
+        msg.setWordWrap(True)
+        msg.setStyleSheet("color: #e6e6eb;")
+        content_layout.addWidget(msg)
+        line_edit = QtWidgets.QLineEdit()
+        line_edit.setPlaceholderText("https://myrient.erista.me/files/Redump/...")
+        line_edit.setText(failed_url)
+        line_edit.setMinimumWidth(450)
+        content_layout.addWidget(line_edit)
+
+        buttons_layout = QtWidgets.QHBoxLayout()
+        buttons_layout.setSpacing(8)
+        buttons_layout.addStretch(1)
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.setObjectName("flatDialogButton")
+        ok_btn = QtWidgets.QPushButton("OK")
+        ok_btn.setObjectName("primaryDialogButton")
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn.clicked.connect(dialog.accept)
+        buttons_layout.addWidget(cancel_btn)
+        buttons_layout.addWidget(ok_btn)
+        content_layout.addLayout(buttons_layout)
+
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            return line_edit.text().strip()
+        return ""
 
     def _on_mcfd_error(self, message: str) -> None:
         self._show_error_dialog("Error", message)
