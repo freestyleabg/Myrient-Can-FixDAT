@@ -26,6 +26,8 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 
@@ -76,6 +78,7 @@ PROGRESS_UPDATE_INTERVAL = 0.2
 CHUNK_SIZE = 1024 * 256  # 256KB
 MAX_SIZE_DIFFERENCE = 1_048_576  # 1MB
 HTTP_USER_AGENT = "MyrientCanFixDAT/1.0"
+DEFAULT_MAX_DOWNLOAD_WORKERS = 4
 
 # UI constants
 WINDOW_MIN_WIDTH = 1200
@@ -618,6 +621,7 @@ class Config:
         self.igir_version_override: str = "4.1.2"
         self.auto_config_yes: bool = True
         self.clean_roms: bool = True
+
 
     def to_dict(self) -> Dict[str, object]:
         """Convert config to dictionary for backward compatibility."""
@@ -1926,6 +1930,11 @@ class DownloadWorker(QtCore.QThread):
         self._speed_history: List[float] = []
         self._max_speed_samples = 10  # Keep last 10 speed measurements
 
+        # Thread-safe state for concurrent downloads
+        self._lock = threading.Lock()
+        self._last_progress_emit = 0.0
+        self._active_file_key = ""
+
     def request_stop(self) -> None:
         self._stop_requested = True
 
@@ -2154,6 +2163,9 @@ class DownloadWorker(QtCore.QThread):
         self.progress_signal.emit(DOWNLOAD_COMPLETE_PROGRESS, 0.0, "Complete", "", "", "")
 
     def _download_with_gui_updates(self, matched_games: List[Dict[str, object]], download_dir: Path) -> None:
+        """Download matched games using a small worker pool (default 4 threads)."""
+        max_workers = DEFAULT_MAX_DOWNLOAD_WORKERS
+
         total_games = len(matched_games)
         total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
 
@@ -2162,112 +2174,195 @@ class DownloadWorker(QtCore.QThread):
 
         successful = 0
         failed = 0
-        total_downloaded = 0
+
+        # Aggregate progress by file key for correct overall progress with concurrency
+        bytes_by_key: Dict[str, int] = {}
+        size_by_key: Dict[str, int] = {}
+
         start_time = time.time()
 
-        for i, game in enumerate(matched_games, 1):
-            if self._stop_requested or self.isInterruptionRequested():
-                self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
-                break
+        def make_key(output_path: Path, game_name: str) -> str:
+            return f"{output_path.name}::{game_name}"
 
-            game_name = str(game.get("Game Name", ""))
-            url = str(game.get("Download URL", ""))
+        def emit_progress_locked(now: float, current_key: str = "") -> None:
+            """
+            Emit a throttled GUI progress update.
+
+            NOTE: must be called with self._lock held.
+            """
+            total_downloaded = sum(bytes_by_key.values())
+            overall_pct = (total_downloaded / total_size * 100.0) if total_size > 0 else 0.0
+
+            elapsed = max(now - start_time, 0.001)
+            rate = total_downloaded / elapsed
+            speed_text = format_speed(rate)
+
+            total_size_text = f"{format_size(total_downloaded)} / {format_size(total_size)}"
+
+            eta_text = "--"
+            remaining = total_size - total_downloaded
+            if rate > 0 and remaining > 0:
+                eta_text = format_time(remaining / rate)
+
+            # Current file progress: show the most recently-updating active download
+            key = current_key or self._active_file_key
+            if key and key in bytes_by_key and key in size_by_key and size_by_key[key] > 0:
+                cur_done = bytes_by_key[key]
+                cur_total = size_by_key[key]
+                self._current_file_progress = f"{format_size(cur_done)} / {format_size(cur_total)}"
+                current_pct = int((cur_done / cur_total) * 100)
+            else:
+                # Explicitly clear so UI can show "--"
+                self._current_file_progress = ""
+                current_pct = 0
+
+            self.progress_signal.emit(
+                overall_pct,
+                current_pct,
+                "",
+                speed_text,
+                total_size_text,
+                eta_text,
+            )
+
+        def download_one(game: Dict[str, object], index: int) -> Tuple[bool, bool, str, int, float]:
+            """
+            Worker task (runs in ThreadPoolExecutor thread).
+
+            Returns:
+                (success, skipped, game_name, downloaded_bytes, elapsed_seconds)
+            """
+            game_name = str(game.get("Game Name", "") or "")
+            url = str(game.get("Download URL", "") or "")
             file_size = int(game.get("File Size", 0) or 0)
             myrient_filename = str(game.get("Myrient Filename") or game.get("Expected Filename") or "")
 
             filename = urllib.parse.unquote(url.split("/")[-1]) if url else ""
             if not filename.endswith(ROM_EXTENSIONS):
-                filename = myrient_filename or filename or f"download_{i}.zip"
+                filename = myrient_filename or filename or f"download_{index}.zip"
 
             output_path = download_dir / filename
+            key = make_key(output_path, game_name)
 
+            # Register expected size and init counters
+            with self._lock:
+                size_by_key[key] = file_size
+                bytes_by_key.setdefault(key, 0)
+
+            # If already exists, skip and treat as success (match existing behaviour)
             if output_path.exists():
-                self.log_signal.emit(f"⏭️  [{i}/{total_games}] {game_name} - Already exists, skipping")
-                successful += 1
-                total_downloaded += file_size  # Count skipped files toward total downloaded
-                continue
+                with self._lock:
+                    bytes_by_key[key] = file_size
+                    self._active_file_key = key
 
-            self.progress_signal.emit(0.0, 0.0, "", "", "", "")
+                    now = time.time()
+                    if (now - self._last_progress_emit) >= PROGRESS_UPDATE_INTERVAL:
+                        self._last_progress_emit = now
+                        emit_progress_locked(now, current_key=key)
 
+                return True, True, game_name, file_size, 0.0
+
+            # Per-file progress callback (called from this worker thread)
             def progress_cb(downloaded: int, total: int, rate: float, elapsed: float) -> None:
-                if total <= 0:
-                    return
-                file_progress = downloaded / total
-                current_percent = file_progress * 100.0
-                overall_progress = DOWNLOAD_START_PROGRESS + ((i - 1 + file_progress) / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
+                now = time.time()
+                with self._lock:
+                    bytes_by_key[key] = downloaded
+                    self._active_file_key = key
 
-                # Calculate metrics with speed averaging
-                # Update speed history for stable ETA
-                if rate > 0:
-                    self._speed_history.append(rate)
-                    if len(self._speed_history) > self._max_speed_samples:
-                        self._speed_history.pop(0)  # Remove oldest
+                    # Global throttle so multiple threads don't spam signals
+                    if (now - self._last_progress_emit) >= PROGRESS_UPDATE_INTERVAL:
+                        self._last_progress_emit = now
+                        emit_progress_locked(now, current_key=key)
 
-                # Use averaged speed for more stable ETA
-                avg_rate = sum(self._speed_history) / len(self._speed_history) if self._speed_history else rate
+            t0 = time.time()
+            success, downloaded_bytes, _ = download_file(
+                url,
+                output_path,
+                expected_size=file_size,
+                progress_callback=progress_cb,
+            )
+            t1 = time.time()
 
-                speed_text = format_speed(avg_rate)  # Show averaged speed
-                # Show total downloaded vs total size
-                total_downloaded_so_far = total_downloaded + downloaded
-                total_size_text = f"{format_size(total_downloaded_so_far)} / {format_size(total_size)}"
-                eta_text = "--"
-                if avg_rate > 0:  # Use averaged rate for ETA
-                    remaining_bytes = total_size - total_downloaded_so_far
-                    if remaining_bytes > 0:
-                        eta_seconds = remaining_bytes / avg_rate
-                        eta_text = format_time(eta_seconds)
-
-                # Current file progress
-                self._current_file_progress = f"{format_size(downloaded)} / {format_size(total)}"
-                self.progress_signal.emit(overall_progress, current_percent, "", speed_text, total_size_text, eta_text)
-
-            overall_progress = DOWNLOAD_START_PROGRESS + (i / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
-            self._current_file_progress = f"0 B / {format_size(file_size)}"
-            self.progress_signal.emit(overall_progress, 0.0, f"Downloading {i}/{total_games}: {game_name[:40]}", "", "", "")
-            self.log_signal.emit(f"[{i}/{total_games}] {game_name} ({format_size(file_size)})")
-
-            try:
-                success, downloaded_bytes, elapsed = download_file(
-                    url,
-                    output_path,
-                    expected_size=file_size,
-                    progress_callback=progress_cb,
-                )
-
-                if self._stop_requested or self.isInterruptionRequested():
-                    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
-                    try:
-                        if tmp.exists():
-                            tmp.unlink()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
-                    break
-
-                self.progress_signal.emit(None, 0.0, "", "", "", "")
-
+            # Final update for this file
+            with self._lock:
                 if success:
-                    successful += 1
-                    total_downloaded += downloaded_bytes
-                    self.progress_signal.emit(
-                        DOWNLOAD_START_PROGRESS + (i / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS),
-                        0.0,
-                        f"Completed {i}/{total_games}: {game_name[:40]}",
-                        "", "", ""
-                    )
-                    self.log_signal.emit(
-                        f"✅ [{i}/{total_games}] {game_name} - {format_size(downloaded_bytes)} in {elapsed:.1f}s"
-                    )
-                else:
-                    failed += 1
-                    self.log_signal.emit(f"❌ [{i}/{total_games}] {game_name} - Failed")
+                    bytes_by_key[key] = downloaded_bytes
+                self._active_file_key = key
+                emit_progress_locked(time.time(), current_key=key)
 
-            except Exception as e:  # noqa: BLE001
-                if self._stop_requested or self.isInterruptionRequested():
-                    self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
-                    break
-                failed += 1
-                self.log_signal.emit(f"❌ [{i}/{total_games}] {game_name} - Error: {e}")
+            return success, False, game_name, downloaded_bytes, (t1 - t0)
+
+        # Initial UI state
+        self.status_signal.emit("Downloading...")
+        with self._lock:
+            self._current_file_progress = ""
+            self._active_file_key = ""
+            self._last_progress_emit = 0.0
+
+        idx = 0
+        active = set()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            # Initial fill
+            while (
+                idx < total_games
+                and len(active) < max_workers
+                and not self._stop_requested
+                and not self.isInterruptionRequested()
+            ):
+                idx += 1
+                game = matched_games[idx - 1]
+                game_name = str(game.get("Game Name", "") or "")
+                file_size = int(game.get("File Size", 0) or 0)
+
+                self.log_signal.emit(f"[{idx}/{total_games}] {game_name} ({format_size(file_size)})")
+                active.add(ex.submit(download_one, game, idx))
+
+            # Refill as futures complete
+            while active:
+                done, not_done = wait(active, return_when=FIRST_COMPLETED)
+                active = not_done
+
+                for fut in done:
+                    try:
+                        ok, skipped, game_name, downloaded_bytes, elapsed = fut.result()
+                        if ok:
+                            successful += 1
+                            if skipped:
+                                self.log_signal.emit(f"⏭️  {game_name} - Already exists, skipping")
+                            else:
+                                self.log_signal.emit(
+                                    f"✅ {game_name} - {format_size(downloaded_bytes)} in {elapsed:.1f}s"
+                                )
+                        else:
+                            failed += 1
+                            self.log_signal.emit(f"❌ {game_name} - Failed")
+                    except Exception as e:  # noqa: BLE001
+                        failed += 1
+                        self.log_signal.emit(f"❌ Download error: {e}")
+
+                # Stop means: do not queue anything new
+                while (
+                    idx < total_games
+                    and len(active) < max_workers
+                    and not self._stop_requested
+                    and not self.isInterruptionRequested()
+                ):
+                    idx += 1
+                    game = matched_games[idx - 1]
+                    game_name = str(game.get("Game Name", "") or "")
+                    file_size = int(game.get("File Size", 0) or 0)
+
+                    self.log_signal.emit(f"[{idx}/{total_games}] {game_name} ({format_size(file_size)})")
+                    active.add(ex.submit(download_one, game, idx))
+
+        if self._stop_requested or self.isInterruptionRequested():
+            self.log_signal.emit("🛑 Stop requested - skipping remaining downloads.")
+            self.status_signal.emit("Stopped")
+
+        # Summary
+        with self._lock:
+            total_downloaded = sum(bytes_by_key.values())
 
         total_elapsed = time.time() - start_time
         avg_rate = total_downloaded / total_elapsed if total_elapsed > 0 else 0.0
@@ -2279,9 +2374,7 @@ class DownloadWorker(QtCore.QThread):
         self.log_signal.emit("=" * 70)
         self.log_signal.emit(f"   ✅ Successful: {successful:,}/{total_games:,}")
         self.log_signal.emit(f"   ❌ Failed: {failed:,}/{total_games:,}")
-        self.log_signal.emit(
-            f"   📦 Total downloaded: {format_size(total_downloaded)}/{format_size(total_size)}"
-        )
+        self.log_signal.emit(f"   📦 Total downloaded: {format_size(total_downloaded)}/{format_size(total_size)}")
         self.log_signal.emit(f"   ⏱️  Time elapsed: {format_time(total_elapsed)}")
         self.log_signal.emit(f"   🚀 Average speed: {format_speed(avg_rate)}")
         self.log_signal.emit("=" * 70)
