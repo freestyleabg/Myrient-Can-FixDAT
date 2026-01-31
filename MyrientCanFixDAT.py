@@ -689,6 +689,11 @@ CONFIG = Config()
 # ============================================================================
 
 ProgressCallback = Callable[[int, int, float, float], None]
+StopCallback = Callable[[], bool]
+
+
+class StopDownload(Exception):
+    """Raised when a download is cancelled by user."""
 
 
 def download_file(
@@ -697,6 +702,7 @@ def download_file(
     expected_size: int = 0,
     progress_callback: Optional[ProgressCallback] = None,
     session: Optional[requests.Session] = None,
+    should_stop: Optional[StopCallback] = None,
 ) -> Tuple[bool, int, float]:
     """Download a file with progress tracking. Uses a temp file then atomic replace."""
     # Use direct requests.get instead of session (like old working script)
@@ -719,17 +725,19 @@ def download_file(
 
         with open(temp_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                if should_stop and should_stop():
+                    raise StopDownload()
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
 
-                    now = time.time()
-                    if progress_callback and (now - last_update) >= PROGRESS_UPDATE_INTERVAL:
-                        elapsed = now - start_time
-                        rate = downloaded / elapsed if elapsed > 0 else 0.0
-                        progress_callback(downloaded, total_size, rate, elapsed)
-                        last_update = now
+                now = time.time()
+                if progress_callback and (now - last_update) >= PROGRESS_UPDATE_INTERVAL:
+                    elapsed = now - start_time
+                    rate = downloaded / elapsed if elapsed > 0 else 0.0
+                    progress_callback(downloaded, total_size, rate, elapsed)
+                    last_update = now
 
         elapsed = time.time() - start_time
         rate = downloaded / elapsed if elapsed > 0 else 0.0
@@ -749,6 +757,14 @@ def download_file(
 
         return True, downloaded, elapsed
 
+    except StopDownload:
+        # best-effort cleanup
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+        return False, downloaded, time.time() - start_time
     except KeyboardInterrupt:
         # best-effort cleanup
         try:
@@ -2218,6 +2234,7 @@ class DownloadWorker(QtCore.QThread):
     """Runs the full workflow for the Qt GUI."""
 
     progress_signal = QtCore.pyqtSignal(object, object, str, str, str, str)  # overall, current_file, text, speed, total_size, eta
+    thread_progress_signal = QtCore.pyqtSignal(int, object, str, str)  # slot_index, percent (or None), label, speed
     status_signal = QtCore.pyqtSignal(str)
     finished_signal = QtCore.pyqtSignal()
     error_signal = QtCore.pyqtSignal(str)
@@ -2230,6 +2247,7 @@ class DownloadWorker(QtCore.QThread):
         self._config = dict(config_snapshot)
         self._use_igir = bool(use_igir)
         self._stop_requested = False
+        self._force_stop_requested = False
         self._current_file_progress = ""
         # Speed averaging for stable ETA calculation
         self._speed_history: List[float] = []
@@ -2242,6 +2260,24 @@ class DownloadWorker(QtCore.QThread):
 
     def request_stop(self) -> None:
         self._stop_requested = True
+
+    def request_force_stop(self) -> None:
+        self._stop_requested = True
+        self._force_stop_requested = True
+
+    def _cleanup_tmp_files(self, download_dir: Path) -> int:
+        """Remove leftover .tmp files in the download directory tree."""
+        deleted = 0
+        try:
+            for tmp_path in download_dir.rglob("*.tmp"):
+                try:
+                    tmp_path.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+        except OSError:
+            return deleted
+        return deleted
 
     def _emit_log_lines(self, text: str) -> None:
         if not text:
@@ -2575,13 +2611,15 @@ class DownloadWorker(QtCore.QThread):
                 eta_text,
             )
 
-        def download_one(game: Dict[str, object], index: int) -> Tuple[bool, bool, str, int, float]:
+        def download_one(game: Dict[str, object], index: int, slot_id: int) -> Tuple[bool, bool, str, int, float]:
             """
             Worker task (runs in ThreadPoolExecutor thread).
 
             Returns:
                 (success, skipped, game_name, downloaded_bytes, elapsed_seconds)
             """
+            nonlocal successful, failed
+
             game_name = str(game.get("Game Name", "") or "")
             url = str(game.get("Download URL", "") or "")
             file_size = int(game.get("File Size", 0) or 0)
@@ -2592,10 +2630,12 @@ class DownloadWorker(QtCore.QThread):
                 folder_name = myrient_filename or (urllib.parse.unquote(url.rstrip("/").split("/")[-1]) if url else f"download_{index}")
                 output_dir = download_dir / folder_name
                 self.log_signal.emit(f"[{index}/{total_games}] {game_name} (folder)")
+                self.thread_progress_signal.emit(slot_id, 0, f"{game_name[:40]} (folder)", "")
                 try:
                     contents = game.get("_folder_contents") or fetch_folder_contents(url)
                     num_files = len(contents)
                     folder_ok = True
+                    folder_downloaded = 0
                     for j, item in enumerate(contents):
                         if self._stop_requested or self.isInterruptionRequested():
                             self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
@@ -2604,14 +2644,19 @@ class DownloadWorker(QtCore.QThread):
                         file_url = str(item.get("url", ""))
                         size = int(item.get("size", 0) or 0)
                         out_path = output_dir / rel
+                        key = make_key(out_path, f"{game_name}:{rel}")
+                        with self._lock:
+                            size_by_key[key] = size
+                            bytes_by_key.setdefault(key, 0)
                         if out_path.exists():
-                            total_downloaded += size
+                            folder_downloaded += size
                             with self._lock:
-                                bytes_by_key[make_key(out_path, f"{game_name}:{rel}")] = size
+                                bytes_by_key[key] = size
                             continue
                         out_path.parent.mkdir(parents=True, exist_ok=True)
 
                         self._current_file_progress = f"0 B / {format_size(size)}"
+                        self.thread_progress_signal.emit(slot_id, 0, f"{format_size(0)} / {format_size(size)}", "")
                         overall_start = DOWNLOAD_START_PROGRESS + ((index - 1 + j / max(num_files, 1)) / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
                         self.progress_signal.emit(overall_start, 0.0, f"Downloading {index}/{total_games}: {game_name[:40]} (file {j + 1}/{num_files})", "", "", "")
 
@@ -2625,7 +2670,9 @@ class DownloadWorker(QtCore.QThread):
                                 if len(self._speed_history) > self._max_speed_samples:
                                     self._speed_history.pop(0)
                             avg_rate = sum(self._speed_history) / len(self._speed_history) if self._speed_history else rate
-                            total_so_far = total_downloaded + downloaded
+                            with self._lock:
+                                bytes_by_key[key] = downloaded
+                                total_so_far = sum(bytes_by_key.values())
                             total_size_text = f"{format_size(total_so_far)} / {format_size(total_size)}"
                             eta_text = "--"
                             if avg_rate > 0:
@@ -2633,27 +2680,44 @@ class DownloadWorker(QtCore.QThread):
                                 if remaining_bytes > 0:
                                     eta_text = format_time(remaining_bytes / avg_rate)
                             self._current_file_progress = f"{format_size(downloaded)} / {format_size(total)}"
+                            self.thread_progress_signal.emit(
+                                slot_id,
+                                (downloaded / total) * 100.0,
+                                f"{format_size(downloaded)} / {format_size(total)}",
+                                format_speed(avg_rate),
+                            )
                             self.progress_signal.emit(overall_progress, (downloaded / total) * 100.0, "", format_speed(avg_rate), total_size_text, eta_text)
 
-                        ok, n, _ = download_file(file_url, out_path, size, progress_callback=folder_progress_cb)
+                        ok, n, _ = download_file(
+                            file_url,
+                            out_path,
+                            size,
+                            progress_callback=folder_progress_cb,
+                            should_stop=lambda: self._force_stop_requested or self.isInterruptionRequested(),
+                        )
                         if ok:
-                            total_downloaded += n
+                            folder_downloaded += n
                             with self._lock:
-                                bytes_by_key[make_key(out_path, f"{game_name}:{rel}")] = n
+                                bytes_by_key[key] = n
                         else:
                             folder_ok = False
                     if self._stop_requested or self.isInterruptionRequested():
-                        break
+                        self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
+                        self.thread_progress_signal.emit(slot_id, None, "--", "")
+                        return False, False, game_name, folder_downloaded, 0.0
                     if folder_ok:
                         successful += 1
                         self.log_signal.emit(f"✅ [{index}/{total_games}] {game_name} (folder) - {num_files} file(s)")
-                    else:
-                        failed += 1
-                        self.log_signal.emit(f"❌ [{index}/{total_games}] {game_name} - Some files failed")
-                except Exception as e:  # noqa: BLE001
+                        self.progress_signal.emit(None, 0.0, "", "", "", "")
+                        self.thread_progress_signal.emit(slot_id, 100, f"{format_size(folder_downloaded)}", "")
+                        return True, False, game_name, folder_downloaded, 0.0
+                    failed += 1
+                    self.log_signal.emit(f"❌ [{index}/{total_games}] {game_name} - Some files failed")
+                except Exception:  # noqa: BLE001
                     failed += 1
                 self.progress_signal.emit(None, 0.0, "", "", "", "")
-                continue
+                self.thread_progress_signal.emit(slot_id, None, "--", "")
+                return False, False, game_name, folder_downloaded, 0.0
 
             filename = myrient_filename or (urllib.parse.unquote(url.split("/")[-1]).rstrip("/") if url else "") or f"download_{index}"
             output_path = download_dir / filename
@@ -2668,10 +2732,10 @@ class DownloadWorker(QtCore.QThread):
             if output_path.exists():
                 self.log_signal.emit(f"⏭️  [{index}/{total_games}] {game_name} - Already exists, skipping")
                 successful += 1
-                total_downloaded += file_size
                 with self._lock:
                     bytes_by_key[key] = file_size
-                continue
+                self.thread_progress_signal.emit(slot_id, 100, "Skipped", "")
+                return True, True, game_name, file_size, 0.0
 
             # Per-file progress callback (called from this worker thread)
             def progress_cb(downloaded: int, total: int, rate: float, elapsed: float) -> None:
@@ -2685,7 +2749,9 @@ class DownloadWorker(QtCore.QThread):
                     if len(self._speed_history) > self._max_speed_samples:
                         self._speed_history.pop(0)
                 avg_rate = sum(self._speed_history) / len(self._speed_history) if self._speed_history else rate
-                total_downloaded_so_far = total_downloaded + downloaded
+                with self._lock:
+                    bytes_by_key[key] = downloaded
+                    total_downloaded_so_far = sum(bytes_by_key.values())
                 total_size_text = f"{format_size(total_downloaded_so_far)} / {format_size(total_size)}"
                 eta_text = "--"
                 if avg_rate > 0:
@@ -2693,12 +2759,17 @@ class DownloadWorker(QtCore.QThread):
                     if remaining_bytes > 0:
                         eta_text = format_time(remaining_bytes / avg_rate)
                 self._current_file_progress = f"{format_size(downloaded)} / {format_size(total)}"
-                with self._lock:
-                    bytes_by_key[key] = downloaded
+                self.thread_progress_signal.emit(
+                    slot_id,
+                    current_percent,
+                    f"{format_size(downloaded)} / {format_size(total)}",
+                    format_speed(avg_rate),
+                )
                 self.progress_signal.emit(overall_progress, current_percent, "", format_speed(avg_rate), total_size_text, eta_text)
 
             overall_progress = DOWNLOAD_START_PROGRESS + (index / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
             self._current_file_progress = f"0 B / {format_size(file_size)}"
+            self.thread_progress_signal.emit(slot_id, 0, f"{format_size(0)} / {format_size(file_size)}", "")
             self.progress_signal.emit(overall_progress, 0.0, f"Downloading {index}/{total_games}: {game_name[:40]}", "", "", "")
             self.log_signal.emit(f"[{index}/{total_games}] {game_name} ({format_size(file_size)})")
 
@@ -2708,6 +2779,7 @@ class DownloadWorker(QtCore.QThread):
                     output_path,
                     expected_size=file_size,
                     progress_callback=progress_cb,
+                    should_stop=lambda: self._force_stop_requested or self.isInterruptionRequested(),
                 )
 
                 if self._stop_requested or self.isInterruptionRequested():
@@ -2718,7 +2790,8 @@ class DownloadWorker(QtCore.QThread):
                     except Exception:  # noqa: BLE001
                         pass
                     self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
-                    break
+                    self.thread_progress_signal.emit(slot_id, None, "--", "")
+                    return False, False, game_name, downloaded_bytes, elapsed
 
                 self.progress_signal.emit(None, 0.0, "", "", "", "")
             except Exception:  # noqa: BLE001
@@ -2731,6 +2804,8 @@ class DownloadWorker(QtCore.QThread):
                 if success:
                     bytes_by_key[key] = downloaded_bytes
                 self._active_file_key = key
+            if not success:
+                self.thread_progress_signal.emit(slot_id, None, "--", "")
             return success, False, game_name, downloaded_bytes, elapsed
 
         # Initial UI state
@@ -2742,6 +2817,8 @@ class DownloadWorker(QtCore.QThread):
 
         idx = 0
         active = set()
+        free_slots = list(range(max_workers))
+        future_to_slot: Dict[object, int] = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             # Initial fill
@@ -2757,7 +2834,10 @@ class DownloadWorker(QtCore.QThread):
                 file_size = int(game.get("File Size", 0) or 0)
 
                 self.log_signal.emit(f"[{idx}/{total_games}] {game_name} ({format_size(file_size)})")
-                active.add(ex.submit(download_one, game, idx))
+                slot_id = free_slots.pop(0) if free_slots else 0
+                future = ex.submit(download_one, game, idx, slot_id)
+                active.add(future)
+                future_to_slot[future] = slot_id
 
             # Refill as futures complete
             while active:
@@ -2766,6 +2846,10 @@ class DownloadWorker(QtCore.QThread):
 
                 for fut in done:
                     try:
+                        slot_id = future_to_slot.pop(fut, None)
+                        if slot_id is not None:
+                            free_slots.append(slot_id)
+                            self.thread_progress_signal.emit(slot_id, None, "--", "")
                         ok, skipped, game_name, downloaded_bytes, elapsed = fut.result()
                         if ok:
                             successful += 1
@@ -2795,11 +2879,17 @@ class DownloadWorker(QtCore.QThread):
                     file_size = int(game.get("File Size", 0) or 0)
 
                     self.log_signal.emit(f"[{idx}/{total_games}] {game_name} ({format_size(file_size)})")
-                    active.add(ex.submit(download_one, game, idx))
+                    slot_id = free_slots.pop(0) if free_slots else 0
+                    future = ex.submit(download_one, game, idx, slot_id)
+                    active.add(future)
+                    future_to_slot[future] = slot_id
 
         if self._stop_requested or self.isInterruptionRequested():
             self.log_signal.emit("🛑 Stop requested - skipping remaining downloads.")
             self.status_signal.emit("Stopped")
+            deleted = self._cleanup_tmp_files(download_dir)
+            if deleted:
+                self.log_signal.emit(f"🧹 Cleaned up {deleted} temp file(s).")
 
         # Summary
         with self._lock:
@@ -3126,8 +3216,8 @@ class MainWindow(QtWidgets.QMainWindow):
         threads_text_layout.addWidget(threads_subtitle)
 
         threads_layout.addWidget(threads_text_container, alignment=QtCore.Qt.AlignVCenter)
-        threads_layout.addStretch()
         threads_layout.addWidget(threads_spin, alignment=QtCore.Qt.AlignVCenter)
+        threads_layout.addStretch()
 
         options_layout.addWidget(threads_row)
 
@@ -3259,7 +3349,9 @@ class MainWindow(QtWidgets.QMainWindow):
         progress_section.addLayout(overall_row)
 
         # Second row: Current file progress bar with Speed and Current Filesize
-        file_row = QtWidgets.QHBoxLayout()
+        self.current_file_row_container = QtWidgets.QWidget()
+        file_row = QtWidgets.QHBoxLayout(self.current_file_row_container)
+        file_row.setContentsMargins(0, 0, 0, 0)
         file_row.setSpacing(12)
 
         # Current file progress bar (taller)
@@ -3300,7 +3392,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_row.addWidget(speed_container)
 
-        progress_section.addLayout(file_row)
+        progress_section.addWidget(self.current_file_row_container)
+
+        # Per-thread progress bars (for parallel downloads)
+        threads_header = QtWidgets.QLabel("Per-Thread Progress")
+        threads_header.setObjectName("sectionHeader")
+        progress_section.addWidget(threads_header)
+
+        self.thread_progress_container = QtWidgets.QWidget()
+        self.thread_progress_layout = QtWidgets.QVBoxLayout(self.thread_progress_container)
+        self.thread_progress_layout.setContentsMargins(0, 0, 0, 0)
+        self.thread_progress_layout.setSpacing(6)
+        self.thread_progress_bars: List[QtWidgets.QProgressBar] = []
+        self.thread_progress_labels: List[QtWidgets.QLabel] = []
+
+        progress_section.addWidget(self.thread_progress_container)
 
         # Add the progress section to runtime layout
         runtime_layout.addLayout(progress_section)
@@ -3596,19 +3702,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.stop_button.setText("Stopping...")
                 if hasattr(self.worker, "request_stop"):
                     self.worker.request_stop()  # type: ignore[attr-defined]
-                    self.log_edit.appendPlainText("🛑 Stop requested - finishing current download...")
+                    self.log_edit.appendPlainText("🛑 Stop requested - no new downloads will be queued.")
                 else:
                     self.worker.requestInterruption()
                     self.log_edit.appendPlainText("🛑 Stop requested...")
             else:
                 # Second click - force stop
+                if hasattr(self.worker, "request_force_stop"):
+                    self.worker.request_force_stop()  # type: ignore[attr-defined]
+                else:
+                    if hasattr(self.worker, "request_stop"):
+                        self.worker.request_stop()  # type: ignore[attr-defined]
                 self.worker.requestInterruption()  # Signal interruption first
-                self.worker.terminate()  # Then terminate forcefully
                 self.stop_button.setText("Force Stopping...")
                 self.log_edit.appendPlainText("🛑 Force stop requested - terminating immediately...")
 
                 # Force immediate cleanup since terminate() might not trigger finished signal
                 QtCore.QTimer.singleShot(100, self._force_cleanup_after_terminate)
+                QtCore.QTimer.singleShot(1000, lambda: self.worker.terminate() if self.worker and self.worker.isRunning() else None)
 
     def _start_mcfd_worker(self, config_snapshot: dict, use_igir: bool) -> None:
         if self.worker and self.worker.isRunning():
@@ -3624,6 +3735,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.overall_progress.setValue(0)
         self.current_file_progress.setValue(0)
+        self._init_thread_progress_bars(int(config_snapshot.get("download_threads", DEFAULT_MAX_DOWNLOAD_WORKERS)))
         self.set_status("Preparing...")
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -3632,6 +3744,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = worker
 
         worker.progress_signal.connect(self._on_mcfd_progress)
+        worker.thread_progress_signal.connect(self._on_thread_progress)
         worker.status_signal.connect(self.set_status)
         worker.log_signal.connect(self.append_log)
         worker.error_signal.connect(self._on_mcfd_error)
@@ -3639,6 +3752,70 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.request_myrient_url_override.connect(self._on_request_myrient_url_override)
         worker.request_download_selection.connect(self._on_request_download_selection)
         worker.start()
+
+    def _init_thread_progress_bars(self, count: int) -> None:
+        if not hasattr(self, "thread_progress_layout"):
+            return
+
+        if hasattr(self, "current_file_row_container"):
+            self.current_file_row_container.setVisible(count <= 1)
+
+        # Clear existing rows
+        while self.thread_progress_layout.count():
+            item = self.thread_progress_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.thread_progress_bars = []
+        self.thread_progress_labels = []
+
+        for i in range(max(1, count)):
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+
+            name_label = QtWidgets.QLabel(f"Thread {i + 1}")
+            name_label.setMinimumWidth(70)
+
+            bar = QtWidgets.QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("%p%")
+            bar.setMinimumHeight(20)
+
+            value_label = QtWidgets.QLabel("--")
+            value_label.setMinimumWidth(120)
+
+            row_layout.addWidget(name_label)
+            row_layout.addWidget(bar, 1)
+            row_layout.addWidget(value_label)
+
+            self.thread_progress_layout.addWidget(row)
+            self.thread_progress_bars.append(bar)
+            self.thread_progress_labels.append(value_label)
+
+    @QtCore.pyqtSlot(int, object, str, str)
+    def _on_thread_progress(self, slot_id: int, percent: object, text: str, speed: str) -> None:
+        if slot_id < 0 or slot_id >= len(getattr(self, "thread_progress_bars", [])):
+            return
+        bar = self.thread_progress_bars[slot_id]
+        label = self.thread_progress_labels[slot_id]
+
+        if percent is None:
+            bar.setValue(0)
+            label.setText("--")
+            return
+
+        try:
+            bar.setValue(int(float(percent)))
+        except Exception:  # noqa: BLE001
+            bar.setValue(0)
+        if speed:
+            label.setText(f"{text} • {speed}" if text else speed)
+        else:
+            label.setText(text or "--")
     
     @QtCore.pyqtSlot(object)
     def _on_request_download_selection(self, matched_games_obj: object) -> None:
@@ -3807,6 +3984,26 @@ class MainWindow(QtWidgets.QMainWindow):
             # If still running after timeout, force cleanup anyway
             self.set_status("Force stopped")
             self._on_worker_finished()
+        self._cleanup_tmp_files_for_downloads()
+
+    def _cleanup_tmp_files_for_downloads(self) -> None:
+        """Best-effort cleanup of leftover temp files in downloads directory."""
+        try:
+            downloads_dir = resolve_path(CONFIG.downloads_directory)
+        except Exception:  # noqa: BLE001
+            return
+        deleted = 0
+        try:
+            for tmp_path in downloads_dir.rglob("*.tmp"):
+                try:
+                    tmp_path.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+        except OSError:
+            return
+        if deleted:
+            self.log_edit.appendPlainText(f"🧹 Cleaned up {deleted} temp file(s).")
 
     def _on_worker_finished(self) -> None:
         # Reset all UI elements to pre-download state
@@ -3819,6 +4016,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_status("Ready")
         self._last_total_size = ""
         self._last_eta = ""
+        if hasattr(self, "thread_progress_bars"):
+            for bar in self.thread_progress_bars:
+                bar.setValue(0)
+        if hasattr(self, "thread_progress_labels"):
+            for label in self.thread_progress_labels:
+                label.setText("--")
 
         # Reset buttons and flags
         self.run_button.setEnabled(True)
