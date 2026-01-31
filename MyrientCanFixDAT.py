@@ -56,6 +56,9 @@ SETTING_DOWNLOADS_DIR = "downloads_directory"
 SETTING_MYRIENT_URL = "myrient_base_url"
 SETTING_USE_IGIR = "use_igir"
 SETTING_CLEAN_ROMS = "clean_roms"
+SETTING_SELECT_DOWNLOADS = "select_downloads"
+SETTING_DOWNLOAD_THREADS = "download_threads"
+
 
 # File and path constants
 DEFAULT_DAT_FALLBACK = "dat/psx.dat"
@@ -1910,6 +1913,145 @@ class _MyrientOverrideReceiver(QtCore.QObject):
             self._event_loop.quit()
 
 
+class _DownloadSelectionReceiver(QtCore.QObject):
+    """Receives selected games from the main window and quits the worker's event loop."""
+
+    @QtCore.pyqtSlot(object)
+    def set_selected_games(self, games_obj: object) -> None:
+        if hasattr(self, "_worker") and hasattr(self, "_event_loop"):
+            # games_obj is either: List[Dict[str, object]] or None
+            self._worker._selected_games_result = games_obj  # type: ignore[attr-defined]
+            self._event_loop.quit()
+
+
+class DownloadSelectionDialog(QtWidgets.QDialog):
+    """Dialog to filter and select which matched downloads to queue."""
+
+    def __init__(self, matched_games: List[Dict[str, object]], parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Downloads")
+        self.resize(850, 650)
+
+        self._matched_games = matched_games
+        self._selected_indexes: List[int] = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("Select downloads to queue")
+        tf = title.font()
+        tf.setBold(True)
+        title.setFont(tf)
+        layout.addWidget(title)
+
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter (type to search)...")
+        layout.addWidget(self.filter_edit)
+
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        layout.addWidget(self.list_widget, 1)
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.setSpacing(8)
+
+        self.selected_label = QtWidgets.QLabel("Selected: 0")
+        self.size_label = QtWidgets.QLabel("Size: 0 B")
+        footer.addWidget(self.selected_label)
+        footer.addSpacing(10)
+        footer.addWidget(self.size_label)
+        footer.addStretch(1)
+
+        select_all_btn = QtWidgets.QPushButton("Select All")
+        select_none_btn = QtWidgets.QPushButton("Select None")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        download_btn = QtWidgets.QPushButton("Download Selected")
+        download_btn.setObjectName("primaryDialogButton")
+
+        footer.addWidget(select_all_btn)
+        footer.addWidget(select_none_btn)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(download_btn)
+
+        layout.addLayout(footer)
+
+        # Populate list (default: checked)
+        for idx, g in enumerate(self._matched_games):
+            name = str(g.get("Game Name", "") or "")
+            size = int(g.get("File Size", 0) or 0)
+            fn = str(g.get("Myrient Filename", "") or "")
+
+            text = f"{name}  —  {format_size(size)}"
+            if fn:
+                text = f"{text}   [{fn}]"
+
+            item = QtWidgets.QListWidgetItem(text)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            item.setData(QtCore.Qt.UserRole, idx)
+            self.list_widget.addItem(item)
+
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.list_widget.itemChanged.connect(self._recalc_selected)
+
+        select_all_btn.clicked.connect(self._select_all)
+        select_none_btn.clicked.connect(self._select_none)
+        cancel_btn.clicked.connect(self.reject)
+        download_btn.clicked.connect(self._accept_selected)
+
+        self._recalc_selected()
+
+    def selected_games(self) -> List[Dict[str, object]]:
+        return [self._matched_games[i] for i in self._selected_indexes]
+
+    def _apply_filter(self, text: str) -> None:
+        q = (text or "").strip().lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setHidden(bool(q) and q not in item.text().lower())
+
+    def _select_all(self) -> None:
+        self.list_widget.blockSignals(True)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if not item.isHidden():
+                item.setCheckState(QtCore.Qt.Checked)
+        self.list_widget.blockSignals(False)
+        self._recalc_selected()
+
+    def _select_none(self) -> None:
+        self.list_widget.blockSignals(True)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if not item.isHidden():
+                item.setCheckState(QtCore.Qt.Unchecked)
+        self.list_widget.blockSignals(False)
+        self._recalc_selected()
+
+    def _recalc_selected(self) -> None:
+        selected: List[int] = []
+        total_size = 0
+
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                idx = int(item.data(QtCore.Qt.UserRole))
+                selected.append(idx)
+                total_size += int(self._matched_games[idx].get("File Size", 0) or 0)
+
+        self._selected_indexes = selected
+        self.selected_label.setText(f"Selected: {len(selected):,}/{len(self._matched_games):,}")
+        self.size_label.setText(f"Size: {format_size(total_size)}")
+
+    def _accept_selected(self) -> None:
+        self._recalc_selected()
+        if not self._selected_indexes:
+            QtWidgets.QMessageBox.warning(self, "Nothing selected", "Please select at least one item to download.")
+            return
+        self.accept()
+
+
 class DownloadWorker(QtCore.QThread):
     """Runs the full workflow for the Qt GUI."""
 
@@ -1919,6 +2061,7 @@ class DownloadWorker(QtCore.QThread):
     error_signal = QtCore.pyqtSignal(str)
     log_signal = QtCore.pyqtSignal(str)
     request_myrient_url_override = QtCore.pyqtSignal(str)  # emitted on 404; main window shows dialog and emits result back
+    request_download_selection = QtCore.pyqtSignal(object)  # emitted to request download selection dialog
 
     def __init__(self, config_snapshot: dict, use_igir: bool, parent=None) -> None:
         super().__init__(parent)
@@ -2148,6 +2291,43 @@ class DownloadWorker(QtCore.QThread):
         self.progress_signal.emit(MATCHED_GAMES_PROGRESS, 0.0, f"Matched {len(matched_games):,} games", "", "", "")
         return matched_games
 
+    def _maybe_select_downloads(self, matched_games: List[Dict[str, object]]) -> Optional[List[Dict[str, object]]]:
+        """Optionally show selection dialog and return selected games.
+        Runs the dialog on the GUI thread and blocks the worker until user chooses.
+        Returns None if user cancels.
+        """
+        if not bool(self._config.get("select_downloads")):
+            return matched_games
+
+        main_win = self.parent()
+        if main_win is None or not hasattr(main_win, "download_selection_result_signal"):
+            return matched_games
+
+        event_loop = QtCore.QEventLoop()
+        self._selected_games_result = None  # type: ignore[attr-defined]
+
+        receiver = _DownloadSelectionReceiver()
+        receiver._worker = self  # type: ignore[attr-defined]
+        receiver._event_loop = event_loop  # type: ignore[attr-defined]
+
+        # connect result -> receiver
+        main_win.download_selection_result_signal.connect(receiver.set_selected_games)
+
+        # ask GUI thread to show the dialog
+        self.request_download_selection.emit(matched_games)
+
+        # block worker thread until GUI responds
+        event_loop.exec_()
+
+        # cleanup connection
+        main_win.download_selection_result_signal.disconnect(receiver.set_selected_games)
+
+        selected = self._selected_games_result  # type: ignore[attr-defined]
+        if selected is None:
+            return None
+
+        return list(selected)
+
     def _download_matched_games(self, matched_games: List[Dict[str, object]]) -> None:
         """Download the matched games."""
         self.log_signal.emit("\n⬇️  Starting downloads...")
@@ -2164,7 +2344,7 @@ class DownloadWorker(QtCore.QThread):
 
     def _download_with_gui_updates(self, matched_games: List[Dict[str, object]], download_dir: Path) -> None:
         """Download matched games using a small worker pool (default 4 threads)."""
-        max_workers = DEFAULT_MAX_DOWNLOAD_WORKERS
+        max_workers = int(self._config.get("download_threads", DEFAULT_MAX_DOWNLOAD_WORKERS))
 
         total_games = len(matched_games)
         total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
@@ -2420,8 +2600,14 @@ class DownloadWorker(QtCore.QThread):
             if not matched_games:
                 return
 
-            # Phase 6: Download matched games
-            self._download_matched_games(matched_games)
+            selected_games = self._maybe_select_downloads(matched_games)
+            if not selected_games:
+                self.status_signal.emit("Cancelled")
+                self.log_signal.emit("ℹ️  Download selection cancelled.")
+                return
+
+            # Phase 6: Download selected games
+            self._download_matched_games(selected_games)
 
             self._log_completion()
 
@@ -2433,6 +2619,7 @@ class DownloadWorker(QtCore.QThread):
 
 class MainWindow(QtWidgets.QMainWindow):
     myrient_override_result_signal = QtCore.pyqtSignal(str)  # emitted with override URL when user provides it (from 404 dialog)
+    download_selection_result_signal = QtCore.pyqtSignal(object)  # emitted with selected downloads from selection dialog
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2616,7 +2803,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "",  # We'll set rich text below
             False,
         )
-        # Configure subtitle with clickable link
         igir_subtitle.setTextFormat(QtCore.Qt.RichText)
         igir_subtitle.setOpenExternalLinks(True)
         igir_subtitle.setText(
@@ -2631,8 +2817,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'github.com/emmercm/igir/'
             '</a>'
         )
-
-
         options_layout.addWidget(igir_row)
 
         clean_row, self.clean_roms_check, self.clean_subtitle, self.clean_title_label = add_option_row(
@@ -2641,6 +2825,48 @@ class MainWindow(QtWidgets.QMainWindow):
             CONFIG.clean_roms,
         )
         options_layout.addWidget(clean_row)
+
+        select_row, self.select_downloads_check, select_subtitle, select_title = add_option_row(
+            "Select Downloads Before Starting",
+            "Filter and download specific matched files (instead of automatically downloading everything).",
+            False,
+        )
+        options_layout.addWidget(select_row)
+
+        # Download Threads (Option Row)
+        threads_row = QtWidgets.QWidget()
+        threads_row.setLayoutDirection(QtCore.Qt.LeftToRight)
+        threads_layout = QtWidgets.QHBoxLayout(threads_row)
+        threads_layout.setSpacing(6)
+
+        threads_spin = QtWidgets.QSpinBox()
+        threads_spin.setRange(1, 16)
+        threads_spin.setValue(DEFAULT_MAX_DOWNLOAD_WORKERS)
+        threads_spin.setFixedWidth(70)
+        threads_spin.setToolTip("Number of parallel downloads to run at once")
+
+        threads_text_container = QtWidgets.QWidget()
+        threads_text_layout = QtWidgets.QVBoxLayout(threads_text_container)
+        threads_text_layout.setContentsMargins(0, 0, 0, 0)
+
+        threads_title = QtWidgets.QLabel("Download Threads")
+        tf = threads_title.font()
+        tf.setBold(True)
+        threads_title.setFont(tf)
+
+        threads_subtitle = QtWidgets.QLabel("Higher = faster downloads, more network usage")
+        threads_subtitle.setStyleSheet("color: gray; font-size: 10px;")
+
+        threads_text_layout.addWidget(threads_title)
+        threads_text_layout.addWidget(threads_subtitle)
+
+        threads_layout.addWidget(threads_text_container, alignment=QtCore.Qt.AlignVCenter)
+        threads_layout.addStretch()
+        threads_layout.addWidget(threads_spin, alignment=QtCore.Qt.AlignVCenter)
+
+        options_layout.addWidget(threads_row)
+
+        self.download_threads_spin = threads_spin
 
         main_layout.addWidget(options_group)
 
@@ -3018,26 +3244,27 @@ class MainWindow(QtWidgets.QMainWindow):
         config_snapshot["list_dat"] = self.dat_edit.text().strip()
         config_snapshot["roms_directory"] = self.roms_edit.text().strip()
         config_snapshot["downloads_directory"] = self.downloads_edit.text().strip()
+        config_snapshot["download_threads"] = self.download_threads_spin.value()
+
 
         url = self.myrient_edit.text().strip()
         if url:
             config_snapshot["myrient_base_url"] = url
 
         config_snapshot["clean_roms"] = self.clean_roms_check.isChecked()
+        config_snapshot["select_downloads"] = self.select_downloads_check.isChecked()
         use_igir = self.use_igir_check.isChecked()
 
         # Check ROM directory and create NOTHINGTOCLEAN file if empty
         roms_dir = Path(config_snapshot["roms_directory"])
         if roms_dir.exists() and roms_dir.is_dir():
             try:
-                # Check if directory contains any files (not just directories)
                 has_files = any(item.is_file() for item in roms_dir.iterdir())
                 if not has_files:
-                    # Create NotRequired directory and NOTHINGTOCLEAN file
                     not_required_dir = roms_dir / NOT_REQUIRED_DIR
                     not_required_dir.mkdir(exist_ok=True)
                     nothing_to_clean_file = not_required_dir / "NOTHINGTOCLEAN"
-                    nothing_to_clean_file.touch()  # Create empty file
+                    nothing_to_clean_file.touch()
                     print(f"📁 Created {nothing_to_clean_file} (ROM directory was empty)")
             except (OSError, PermissionError) as e:
                 print(f"⚠️  Could not check/create NOTHINGTOCLEAN file: {e}")
@@ -3093,7 +3320,18 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.error_signal.connect(self._on_mcfd_error)
         worker.finished_signal.connect(self._on_worker_finished)
         worker.request_myrient_url_override.connect(self._on_request_myrient_url_override)
+        worker.request_download_selection.connect(self._on_request_download_selection)
         worker.start()
+    
+    @QtCore.pyqtSlot(object)
+    def _on_request_download_selection(self, matched_games_obj: object) -> None:
+        matched_games = list(matched_games_obj or [])
+        dlg = DownloadSelectionDialog(matched_games, parent=self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.download_selection_result_signal.emit(dlg.selected_games())
+        else:
+            self.download_selection_result_signal.emit(None)
+
 
     @QtCore.pyqtSlot(object, object, str, str, str, str)
     def _on_mcfd_progress(self, overall, current_file, text: str, speed: str, total_size: str, eta: str) -> None:
@@ -3276,72 +3514,71 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker._current_file_progress = ""
         self.worker = None
 
-    def _load_settings(self) -> None:
-        """Load saved settings from QSettings.
 
-        Settings are stored using Qt's QSettings system, which automatically
-        chooses the appropriate storage location based on the platform:
-        - Windows: Registry (HKCU\Software\MyrientCanFixDAT)
-        - macOS: ~/Library/Preferences/com.MyrientCanFixDAT.plist
-        - Linux: ~/.config/MyrientCanFixDAT.conf
-        """
+    def _load_settings(self) -> None:
         settings = QSettings("MyrientCanFixDAT", "Settings")
 
-        # Load path settings with fallbacks to initial defaults
-        # Normalize all paths for consistent display (OS-native separators)
-        
-        # DAT file: use cached DAT if found, otherwise empty
         dat_path = settings.value(SETTING_DAT_FILE, get_initial_dat_file(), str)
         self.dat_edit.setText(normalize_path_display(dat_path))
-        
-        # ROMs directory: empty by default - user must set
+
         roms_path = settings.value(SETTING_ROMS_DIR, CONFIG.roms_directory, str)
         self.roms_edit.setText(normalize_path_display(roms_path))
-        
-        # Downloads directory: empty by default - user must set
+
         downloads_path = settings.value(SETTING_DOWNLOADS_DIR, CONFIG.downloads_directory, str)
         self.downloads_edit.setText(normalize_path_display(downloads_path))
-        
-        # Myrient URL: use saved value or default
+
         self.myrient_edit.setText(
             settings.value(SETTING_MYRIENT_URL, CONFIG.myrient_base_url or "", str)
         )
 
-        # Load checkbox settings
         self.use_igir_check.setChecked(
             settings.value(SETTING_USE_IGIR, False, bool)
         )
         self.clean_roms_check.setChecked(
             settings.value(SETTING_CLEAN_ROMS, CONFIG.clean_roms, bool)
         )
+        self.select_downloads_check.setChecked(
+            settings.value(SETTING_SELECT_DOWNLOADS, False, bool)
+        )
+
+        self.download_threads_spin.setValue(
+            settings.value(
+                SETTING_DOWNLOAD_THREADS,
+                DEFAULT_MAX_DOWNLOAD_WORKERS,
+                int,
+            )
+        )
 
     def _save_settings(self) -> None:
-        """Save current settings to QSettings."""
         settings = QSettings("MyrientCanFixDAT", "Settings")
 
-        # Save path settings
         settings.setValue(SETTING_DAT_FILE, self.dat_edit.text().strip())
         settings.setValue(SETTING_ROMS_DIR, self.roms_edit.text().strip())
         settings.setValue(SETTING_DOWNLOADS_DIR, self.downloads_edit.text().strip())
         settings.setValue(SETTING_MYRIENT_URL, self.myrient_edit.text().strip())
 
-        # Save checkbox settings
         settings.setValue(SETTING_USE_IGIR, self.use_igir_check.isChecked())
         settings.setValue(SETTING_CLEAN_ROMS, self.clean_roms_check.isChecked())
+        settings.setValue(SETTING_SELECT_DOWNLOADS, self.select_downloads_check.isChecked())
 
-        settings.sync()  # Ensure settings are written immediately
+        settings.setValue(
+            SETTING_DOWNLOAD_THREADS,
+            self.download_threads_spin.value()
+        )
+
+        settings.sync()
 
     def _connect_settings_signals(self) -> None:
-        """Connect signals to automatically save settings when they change."""
-        # Save settings when text changes (with debouncing to avoid too frequent saves)
         self.dat_edit.textChanged.connect(self._on_settings_changed)
         self.roms_edit.textChanged.connect(self._on_settings_changed)
         self.downloads_edit.textChanged.connect(self._on_settings_changed)
         self.myrient_edit.textChanged.connect(self._on_settings_changed)
 
-        # Save settings when checkboxes change
         self.use_igir_check.stateChanged.connect(self._on_settings_changed)
         self.clean_roms_check.stateChanged.connect(self._on_settings_changed)
+        self.select_downloads_check.stateChanged.connect(self._on_settings_changed)
+        self.download_threads_spin.valueChanged.connect(self._on_settings_changed)
+
 
     def _on_settings_changed(self) -> None:
         """Handle settings changes - save after a short delay to avoid excessive writes."""
