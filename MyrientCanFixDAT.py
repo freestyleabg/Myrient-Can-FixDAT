@@ -3422,6 +3422,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_edit.setReadOnly(True)
         self.log_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
         self.log_edit.setStyleSheet(f"font-family: Consolas, monospace; font-size: {LOG_FONT_SIZE}px;")
+        self.log_edit.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.log_edit.setMinimumHeight(self.log_edit.sizeHint().height())
         runtime_layout.addWidget(self.log_edit, 1)
 
         main_layout.addWidget(runtime_group, 1)
