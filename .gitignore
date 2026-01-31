@@ -41,3 +41,6 @@ fixdat_temp.dat
 
 # PyInstaller artifacts
 *.manifest
+
+# directories
+dat/

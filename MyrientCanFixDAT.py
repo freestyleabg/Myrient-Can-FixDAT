@@ -624,6 +624,7 @@ class Config:
         self.igir_version_override: str = "4.1.2"
         self.auto_config_yes: bool = True
         self.clean_roms: bool = True
+        self.include_clones: bool = True  # When False (1G1R), exclude cloneof entries
 
 
     def to_dict(self) -> Dict[str, object]:
@@ -638,6 +639,7 @@ class Config:
             "igir_version_override": self.igir_version_override,
             "auto_config_yes": self.auto_config_yes,
             "clean_roms": self.clean_roms,
+            "include_clones": self.include_clones,
         }
 
     def update_from_dict(self, data: Dict[str, object]) -> None:
@@ -1331,30 +1333,37 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
                     continue
 
                 href = link.get("href")
-                if not href or href.startswith("?") or href.endswith("/") or href.startswith("/"):
+                if not href or href.startswith("?") or href.startswith("/"):
                     continue
 
-                filename = urllib.parse.unquote(href).strip()
+                is_folder = href.endswith("/")
+                filename = urllib.parse.unquote(href).strip().rstrip("/")
+                if filename in (".", "..") or filename.startswith("../"):
+                    continue
 
-                # Look for size in table cells
+                # Look for size in table cells (files only; folders often show "-")
                 size_bytes = 0
-                cells = row.find_all("td")
-                for cell in cells:
-                    cell_text = cell.get_text().strip()
-                    # Parse size from cell text (like old script)
-                    m = re.match(r"^\s*([\d.]+)\s*([KMGT]?I?B)\s*$", cell_text, re.IGNORECASE)
-                    if m:
-                        num = float(m.group(1))
-                        unit = m.group(2).upper()
-                        if unit in SIZE_MULTIPLIERS:
-                            size_bytes = int(num * SIZE_MULTIPLIERS[unit])
-                            break
+                if not is_folder:
+                    cells = row.find_all("td")
+                    for cell in cells:
+                        cell_text = cell.get_text().strip()
+                        m = re.match(r"^\s*([\d.]+)\s*([KMGT]?I?B)\s*$", cell_text, re.IGNORECASE)
+                        if m:
+                            num = float(m.group(1))
+                            unit = m.group(2).upper()
+                            if unit in SIZE_MULTIPLIERS:
+                                size_bytes = int(num * SIZE_MULTIPLIERS[unit])
+                                break
 
+                full_url = system_url.rstrip("/") + "/" + href
+                if is_folder and not full_url.endswith("/"):
+                    full_url += "/"
                 files.append(
                     {
                         "filename": filename,
-                        "url": system_url.rstrip("/") + "/" + href,
+                        "url": full_url,
                         "size": size_bytes,
+                        "is_folder": is_folder,
                     }
                 )
             return files
@@ -1362,9 +1371,13 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
         # Fallback to link text parsing
         for link in soup.find_all("a"):
             href = link.get("href")
-            if not href or href.startswith("?") or href.endswith("/") or href.startswith("/"):
+            if not href or href.startswith("?") or href.startswith("/"):
                 continue
 
+            is_folder = href.endswith("/")
+            raw_name = urllib.parse.unquote(href).strip().rstrip("/")
+            if raw_name in (".", "..") or raw_name.startswith("../"):
+                continue
             # Many Myrient listings show "Filename - 25.3 MiB" as link text
             text = (link.get_text() or "").strip()
             filename = None
@@ -1376,13 +1389,11 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
                     filename = parts[0].strip()
                     size_str = parts[1].strip()
 
-            # If link text doesn't contain metadata, fall back to href
             if not filename:
-                filename = urllib.parse.unquote(href).strip()
+                filename = urllib.parse.unquote(href).strip().rstrip("/")
 
             size_bytes = 0
-            if size_str:
-                # Parse size (KiB/MiB/GiB)
+            if not is_folder and size_str:
                 m = re.match(r"^\s*([\d.]+)\s*([KMG])iB\s*$", size_str)
                 if m:
                     num = float(m.group(1))
@@ -1390,11 +1401,15 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
                     mult = SIZE_MULTIPLIERS[unit]
                     size_bytes = int(num * mult)
 
+            full_url = system_url.rstrip("/") + "/" + href
+            if is_folder and not full_url.endswith("/"):
+                full_url += "/"
             files.append(
                 {
                     "filename": filename,
-                    "url": system_url.rstrip("/") + "/" + href,
+                    "url": full_url,
                     "size": size_bytes,
+                    "is_folder": is_folder,
                 }
             )
         return files
@@ -1410,36 +1425,39 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
             continue
 
         href = link_match.group(1)
-        if not href or href.startswith("?") or href.endswith("/") or href.startswith("/"):
+        if not href or href.startswith("?") or href.startswith("/"):
             continue
 
-        filename = urllib.parse.unquote(href).strip()
-
-        # Look for size in table cells
+        is_folder = href.endswith("/")
+        filename = urllib.parse.unquote(href).strip().rstrip("/")
+        if filename in (".", "..") or filename.startswith("../"):
+            continue
         size_bytes = 0
-        for cell_match in re.finditer(r'<td[^>]*>([^<]+)</td>', row_html, re.IGNORECASE):
-            cell_text = cell_match.group(1).strip()
-            # Parse size from cell text
-            m = re.match(r"^\s*([\d.]+)\s*([KMGT]?I?B)\s*$", cell_text, re.IGNORECASE)
-            if m:
-                num = float(m.group(1))
-                unit = m.group(2).upper()
-                if unit in SIZE_MULTIPLIERS:
-                    size_bytes = int(num * SIZE_MULTIPLIERS[unit])
-                    break
-
+        if not is_folder:
+            for cell_match in re.finditer(r'<td[^>]*>([^<]+)</td>', row_html, re.IGNORECASE):
+                cell_text = cell_match.group(1).strip()
+                m = re.match(r"^\s*([\d.]+)\s*([KMGT]?I?B)\s*$", cell_text, re.IGNORECASE)
+                if m:
+                    num = float(m.group(1))
+                    unit = m.group(2).upper()
+                    if unit in SIZE_MULTIPLIERS:
+                        size_bytes = int(num * SIZE_MULTIPLIERS[unit])
+                        break
+        full_url = system_url.rstrip("/") + "/" + href
+        if is_folder and not full_url.endswith("/"):
+            full_url += "/"
         files.append(
-            {"filename": filename, "url": system_url.rstrip("/") + "/" + href, "size": size_bytes}
+            {"filename": filename, "url": full_url, "size": size_bytes, "is_folder": is_folder}
         )
 
-    # If no table rows found, fall back to simple link parsing
     if not files:
         for m in re.finditer(r'<a href="([^"]+)">([^<]+)</a>', html, flags=re.IGNORECASE):
             href = m.group(1)
             text = m.group(2).strip()
-            if not href or href.startswith("?") or href.endswith("/") or href.startswith("/"):
+            if not href or href.startswith("?") or href.startswith("/"):
                 continue
 
+            is_folder = href.endswith("/")
             filename = None
             size_str = None
             if " - " in text:
@@ -1448,19 +1466,23 @@ def _parse_myrient_listing_html(html: str, system_url: str) -> List[Dict[str, ob
                     filename = parts[0].strip()
                     size_str = parts[1].strip()
             if not filename:
-                filename = urllib.parse.unquote(href).strip()
+                filename = urllib.parse.unquote(href).strip().rstrip("/")
+            if filename in (".", "..") or filename.startswith("../"):
+                continue
 
             size_bytes = 0
-            if size_str:
+            if not is_folder and size_str:
                 mm = re.match(r"^\s*([\d.]+)\s*([KMG])iB\s*$", size_str)
                 if mm:
                     num = float(mm.group(1))
                     unit = mm.group(2)
                     mult = SIZE_MULTIPLIERS[unit]
                     size_bytes = int(num * mult)
-
+            full_url = system_url.rstrip("/") + "/" + href
+            if is_folder and not full_url.endswith("/"):
+                full_url += "/"
             files.append(
-                {"filename": filename, "url": system_url.rstrip("/") + "/" + href, "size": size_bytes}
+                {"filename": filename, "url": full_url, "size": size_bytes, "is_folder": is_folder}
             )
 
     return files
@@ -1479,7 +1501,7 @@ def fetch_myrient_index(system_url: str) -> Tuple[Optional[List[Dict[str, object
         resp = requests.get(system_url, timeout=DEFAULT_TIMEOUT)
         resp.raise_for_status()
         files = _parse_myrient_listing_html(resp.text, system_url)
-        print(f"📁 Found {len(files)} files in Myrient directory")
+        print(f"📁 Found {len(files)} entries (files + folders) in Myrient directory")
         return files, None
     except requests.Timeout:
         print(f"❌ Timeout fetching Myrient index: {system_url}")
@@ -1495,6 +1517,69 @@ def fetch_myrient_index(system_url: str) -> Tuple[Optional[List[Dict[str, object
     except Exception as e:  # noqa: BLE001
         print(f"❌ Unexpected error fetching Myrient index: {e}")
         return None, "error"
+
+
+def fetch_folder_contents(
+    folder_url: str,
+) -> List[Dict[str, object]]:
+    """Recursively list all files under a Myrient folder. Returns list of {relative_path, url, size}."""
+    base = folder_url.rstrip("/") + "/"
+    try:
+        resp = requests.get(base, timeout=DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️ Could not fetch folder {base}: {e}")
+        return []
+    listing = _parse_myrient_listing_html(resp.text, base)
+    result: List[Dict[str, object]] = []
+    for entry in listing:
+        fn = str(entry.get("filename", "") or "").strip()
+        if not fn or fn in (".", "..") or fn.startswith("../"):
+            continue
+        is_folder = entry.get("is_folder", False)
+        url = str(entry.get("url", "") or "")
+        size = int(entry.get("size", 0) or 0)
+        if is_folder:
+            subfiles = fetch_folder_contents(url)
+            prefix = fn + "/"
+            for sf in subfiles:
+                result.append({
+                    "relative_path": prefix + str(sf.get("relative_path", "")),
+                    "url": sf.get("url", ""),
+                    "size": int(sf.get("size", 0) or 0),
+                })
+        else:
+            result.append({"relative_path": fn, "url": url, "size": size})
+    return result
+
+
+def enrich_matched_games_with_folder_sizes(
+    matched_games: List[Dict[str, object]],
+    log_callback: Optional[object] = None,
+) -> None:
+    """For each folder game, fetch contents, set File Size to sum of file sizes, and cache _folder_contents for download."""
+    folder_games = [g for g in matched_games if g.get("is_folder")]
+    if not folder_games:
+        return
+    if callable(log_callback):
+        try:
+            log_callback("Fetching folder sizes...")
+        except Exception:  # noqa: BLE001
+            pass
+    for game in matched_games:
+        if not game.get("is_folder"):
+            continue
+        url = str(game.get("Download URL", "") or "")
+        if not url:
+            continue
+        try:
+            contents = fetch_folder_contents(url)
+            total = sum(int(c.get("size", 0) or 0) for c in contents)
+            game["File Size"] = total
+            game["_folder_contents"] = contents
+        except Exception:  # noqa: BLE001
+            game["File Size"] = 0
+            game["_folder_contents"] = []
 
 
 def standardize_game_entry(game: Dict[str, str]) -> Dict[str, str]:
@@ -1531,39 +1616,31 @@ def match_games_with_myrient(
         print("❌ No Myrient index available")
         return None
 
-    # Build a simple lookup map using exact filename matching (without .zip extension)
+    # Build lookup map: key = game name (stem). Accept any file type; folders = single entity.
+    # Stem: for files strip any extension; for folders use name as-is. Prefer folder over file when both exist.
     index_map: Dict[str, Dict[str, object]] = {}
 
     for f in myrient_index:
-        fn = str(f.get("filename", "") or "")
+        fn = str(f.get("filename", "") or "").strip()
         if not fn:
             continue
-
-        # Remove .zip/.7z/.rar extension for matching
-        stem = re.sub(r'\.(zip|7z|rar)$', '', fn, flags=re.IGNORECASE)
-
-        # Use exact filename stem as key (no normalization)
-        if stem not in index_map:
+        is_folder = f.get("is_folder", False)
+        stem = fn if is_folder else re.sub(r"\.[^.]+$", "", fn)
+        if not stem:
+            continue
+        existing = index_map.get(stem)
+        # Prefer folder (one entity with all contents) over a single file
+        if existing is None or (is_folder and not existing.get("is_folder", False)):
             index_map[stem] = f
 
     matched_games: List[Dict[str, object]] = []
 
     for game in games:
-        # Games are now pre-standardized to use "Game Name" key
         game_name = (game.get("Game Name") or "").strip()
         if not game_name:
             continue
 
-        # Exact matching: look for the game name directly in the index
         best = index_map.get(game_name)
-
-        # Debug: show matching for specific game
-        if "007 - The World Is Not Enough" in game_name:
-            print(f"DEBUG: Standardized Game: '{game_name}', Matches: '{best.get('filename', '') if best else 'NO MATCH'}'")
-            if not best:
-                # Show what keys are available
-                available_keys = [k for k in index_map.keys() if "007" in k][:5]  # Keys containing "007"
-                print(f"DEBUG: Available keys with '007': {available_keys}")
 
         if best:
             matched_games.append(
@@ -1573,6 +1650,7 @@ def match_games_with_myrient(
                     "Download URL": best.get("url", ""),
                     "File Size": int(best.get("size", 0) or 0),
                     "Expected Filename": game.get("ROM", game_name),
+                    "is_folder": best.get("is_folder", False),
                 }
             )
 
@@ -1646,10 +1724,51 @@ def infer_myrient_url_from_dat(dat_path: Path, base_url: str) -> Optional[str]:
         return None
 
 
-def parse_fixdat(fixdat_path: Path, original_dat_path: Optional[Path] = None) -> Optional[List[Dict[str, str]]]:
-    """Parse a fixdat (DAT file) and extract game names."""
+def is_retroachievements_dat(dat_path: Path) -> bool:
+    """Return True if the DAT file is a RetroAchievements DAT (by homepage in header)."""
+    if not dat_path.exists() or not dat_path.is_file():
+        return False
+    try:
+        tree = ET.parse(dat_path)
+        root = tree.getroot()
+        header = root.find("header")
+        if header is None:
+            return False
+        homepage_elem = header.find("homepage")
+        if homepage_elem is None or not (homepage_elem.text or "").strip():
+            return False
+        homepage = (homepage_elem.text or "").strip()
+        return "retroachievements.org" in homepage
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def dat_has_clones(dat_path: Path) -> bool:
+    """Return True if the DAT has any game/machine with a cloneof attribute (parent/clone relationship)."""
+    if not dat_path.exists() or not dat_path.is_file():
+        return False
+    try:
+        tree = ET.parse(dat_path)
+        root = tree.getroot()
+        for tag in ("game", "machine"):
+            for elem in root.findall(f".//{tag}"):
+                if (elem.get("cloneof") or "").strip():
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def parse_fixdat(
+    fixdat_path: Path,
+    original_dat_path: Optional[Path] = None,
+    include_clones: bool = True,
+) -> Optional[List[Dict[str, str]]]:
+    """Parse a fixdat (DAT file) and extract game names. If include_clones is False, skip entries with cloneof."""
     _ = original_dat_path  # reserved for future use / debug
     print(f"\n📄 Parsing fixdat: {fixdat_path}")
+    if not include_clones:
+        print("   ℹ️  Excluding clones (1G1R) — only parent entries will be included.")
 
     try:
         tree = ET.parse(fixdat_path)
@@ -1677,14 +1796,18 @@ def parse_fixdat(fixdat_path: Path, original_dat_path: Optional[Path] = None) ->
 
     # Try with namespace-aware search first, then fallback to regular search
     game_elements = root.findall(".//game", ns) if ns else root.findall(".//game")
+    is_retroachievements_format = False
 
     if not game_elements:
-        # Try alternative approaches if no games found
-        # Check if we have a default namespace and try without it
+        # Try without namespace
         if ns:
             game_elements = root.findall(".//game")
-
-        # If still no games, check the actual structure
+        if not game_elements:
+            # RetroAchievements DATs use <machine> instead of <game>, and <disk> instead of <rom>
+            game_elements = root.findall(".//machine", ns) if ns else root.findall(".//machine")
+            if ns and not game_elements:
+                game_elements = root.findall(".//machine")
+            is_retroachievements_format = bool(game_elements)
         if not game_elements:
             for child in root:
                 if child.tag.endswith('game') or 'game' in child.tag.lower():
@@ -1692,38 +1815,46 @@ def parse_fixdat(fixdat_path: Path, original_dat_path: Optional[Path] = None) ->
                     break
 
     for game_elem in game_elements:
-        # Try to find description element
-        desc_elem = game_elem.find("description", ns) if ns else game_elem.find("description")
-        if desc_elem is None and ns:
-            # Try without namespace
-            desc_elem = game_elem.find("description")
-
-        if desc_elem is None:
-            # Try alternative element names
-            for alt_name in ["description", "{*}description"]:
-                desc_elem = game_elem.find(alt_name, ns) if ns else game_elem.find(alt_name)
-                if desc_elem is not None:
-                    break
-
-        if desc_elem is None or not (desc_elem.text or "").strip():
+        # Skip clones when user chose 1G1R (parents only)
+        if not include_clones and (game_elem.get("cloneof") or "").strip():
             continue
-
-        game_name = (desc_elem.text or "").strip()
-
-        # Find ROM element
-        rom_elem = game_elem.find("rom", ns) if ns else game_elem.find("rom")
-        if rom_elem is None and ns:
-            rom_elem = game_elem.find("rom")
-
-        if rom_elem is None:
-            continue
-
-        rom_name = rom_elem.get("name") or game_name
-        rom_size = rom_elem.get("size") or "0"
-
-        # Debug: compare fixdat vs IGIR report for specific game
-        if "007 - The World Is Not Enough" in game_name:
-            print(f"DEBUG: Fixdat - Game Name: '{game_name}', ROM: '{rom_name}', Size: '{rom_size}'")
+        if is_retroachievements_format:
+            # RetroAchievements: <machine name="Game Name"> with <disk name="file.chd"/> or <rom name="..." size="..."/>
+            game_name = (game_elem.get("name") or "").strip()
+            if not game_name:
+                desc_elem = game_elem.find("description", ns) if ns else game_elem.find("description")
+                if desc_elem is not None and (desc_elem.text or "").strip():
+                    game_name = (desc_elem.text or "").strip()
+            if not game_name:
+                continue
+            # Prefer <disk> then <rom> (RA DATs often use <disk> for CHD etc.)
+            rom_elem = game_elem.find("disk", ns) if ns else game_elem.find("disk")
+            if rom_elem is None:
+                rom_elem = game_elem.find("rom", ns) if ns else game_elem.find("rom")
+            if rom_elem is None:
+                continue
+            rom_name = (rom_elem.get("name") or "").strip() or game_name
+            rom_size = rom_elem.get("size") or "0"
+        else:
+            # Standard DAT: <game> with <description> and <rom>
+            desc_elem = game_elem.find("description", ns) if ns else game_elem.find("description")
+            if desc_elem is None and ns:
+                desc_elem = game_elem.find("description")
+            if desc_elem is None:
+                for alt_name in ["description", "{*}description"]:
+                    desc_elem = game_elem.find(alt_name, ns) if ns else game_elem.find(alt_name)
+                    if desc_elem is not None:
+                        break
+            if desc_elem is None or not (desc_elem.text or "").strip():
+                continue
+            game_name = (desc_elem.text or "").strip()
+            rom_elem = game_elem.find("rom", ns) if ns else game_elem.find("rom")
+            if rom_elem is None and ns:
+                rom_elem = game_elem.find("rom")
+            if rom_elem is None:
+                continue
+            rom_name = rom_elem.get("name") or game_name
+            rom_size = rom_elem.get("size") or "0"
 
         games.append({"Game Name": game_name, "ROM": rom_name, "Size": rom_size})
 
@@ -1741,6 +1872,7 @@ def download_missing_games(matched_games: List[Dict[str, object]], downloads_dir
         print("❌ No games to download")
         return
 
+    enrich_matched_games_with_folder_sizes(matched_games)
     total_games = len(matched_games)
     total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
     print(f"📥 Downloading {total_games:,} games ({format_size(total_size)})")
@@ -1757,11 +1889,41 @@ def download_missing_games(matched_games: List[Dict[str, object]], downloads_dir
         url = str(game.get("Download URL", ""))
         file_size = int(game.get("File Size", 0) or 0)
         myrient_filename = str(game.get("Myrient Filename") or game.get("Expected Filename") or "")
+        is_folder = game.get("is_folder", False)
 
-        filename = urllib.parse.unquote(url.split("/")[-1]) if url else ""
-        if not filename.endswith((".zip", ".7z", ".rar")):
-            filename = myrient_filename or filename or f"download_{i}.zip"
+        if is_folder:
+            folder_name = myrient_filename or (urllib.parse.unquote(url.rstrip("/").split("/")[-1]) if url else f"download_{i}")
+            output_dir = downloads_dir / folder_name
+            print(f"[{i}/{total_games}] {game_name} (folder)")
+            try:
+                contents = game.get("_folder_contents") or fetch_folder_contents(url)
+                folder_ok = True
+                for item in contents:
+                    rel = str(item.get("relative_path", ""))
+                    file_url = str(item.get("url", ""))
+                    size = int(item.get("size", 0) or 0)
+                    out_path = output_dir / rel
+                    if out_path.exists():
+                        total_downloaded += size
+                        continue
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    ok, n, _ = download_file(file_url, out_path, size)
+                    if ok:
+                        total_downloaded += n
+                    else:
+                        folder_ok = False
+                if folder_ok:
+                    successful += 1
+                    print(f"✅ [{i}/{total_games}] {game_name} (folder) - {len(contents)} file(s)")
+                else:
+                    failed += 1
+                    print(f"❌ [{i}/{total_games}] {game_name} - Some files failed")
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                print(f"❌ [{i}/{total_games}] {game_name} - Error: {e}")
+            continue
 
+        filename = myrient_filename or (urllib.parse.unquote(url.split("/")[-1]).rstrip("/") if url else "") or f"download_{i}"
         output_path = downloads_dir / filename
 
         if output_path.exists():
@@ -2213,9 +2375,14 @@ class DownloadWorker(QtCore.QThread):
             self.log_signal.emit("\n📄 Parsing fixdat...")
             original_dat = resolve_path(CONFIG.list_dat) if self._use_igir else None
 
+            include_clones = getattr(CONFIG, "include_clones", True)
             stdout_capture = io.StringIO()
             with contextlib.redirect_stdout(stdout_capture):
-                games = parse_fixdat(manual_fixdat or resolve_path(CONFIG.list_dat), original_dat)
+                games = parse_fixdat(
+                    manual_fixdat or resolve_path(CONFIG.list_dat),
+                    original_dat,
+                    include_clones=include_clones,
+                )
             self._emit_log_lines(stdout_capture.getvalue())
 
             if not games:
@@ -2282,6 +2449,8 @@ class DownloadWorker(QtCore.QThread):
             self.status_signal.emit("No matches found")
             return None
 
+        self.log_signal.emit("Computing total size (folder contents)...")
+        enrich_matched_games_with_folder_sizes(matched_games, log_callback=lambda msg: self.log_signal.emit(msg))
         total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
         self.log_signal.emit("\n📊 Summary:")
         self.log_signal.emit(f"   📋 Total missing: {len(games):,}")
@@ -2347,6 +2516,7 @@ class DownloadWorker(QtCore.QThread):
         max_workers = int(self._config.get("download_threads", DEFAULT_MAX_DOWNLOAD_WORKERS))
 
         total_games = len(matched_games)
+        # Folder sizes were set by enrich_matched_games_with_folder_sizes in _match_games_with_myrient
         total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
 
         self.log_signal.emit(f"📥 Downloading {total_games:,} games ({format_size(total_size)})")
@@ -2416,11 +2586,76 @@ class DownloadWorker(QtCore.QThread):
             url = str(game.get("Download URL", "") or "")
             file_size = int(game.get("File Size", 0) or 0)
             myrient_filename = str(game.get("Myrient Filename") or game.get("Expected Filename") or "")
+            is_folder = game.get("is_folder", False)
 
-            filename = urllib.parse.unquote(url.split("/")[-1]) if url else ""
-            if not filename.endswith(ROM_EXTENSIONS):
-                filename = myrient_filename or filename or f"download_{index}.zip"
+            if is_folder:
+                folder_name = myrient_filename or (urllib.parse.unquote(url.rstrip("/").split("/")[-1]) if url else f"download_{index}")
+                output_dir = download_dir / folder_name
+                self.log_signal.emit(f"[{index}/{total_games}] {game_name} (folder)")
+                try:
+                    contents = game.get("_folder_contents") or fetch_folder_contents(url)
+                    num_files = len(contents)
+                    folder_ok = True
+                    for j, item in enumerate(contents):
+                        if self._stop_requested or self.isInterruptionRequested():
+                            self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
+                            break
+                        rel = str(item.get("relative_path", ""))
+                        file_url = str(item.get("url", ""))
+                        size = int(item.get("size", 0) or 0)
+                        out_path = output_dir / rel
+                        if out_path.exists():
+                            total_downloaded += size
+                            with self._lock:
+                                bytes_by_key[make_key(out_path, f"{game_name}:{rel}")] = size
+                            continue
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
 
+                        self._current_file_progress = f"0 B / {format_size(size)}"
+                        overall_start = DOWNLOAD_START_PROGRESS + ((index - 1 + j / max(num_files, 1)) / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
+                        self.progress_signal.emit(overall_start, 0.0, f"Downloading {index}/{total_games}: {game_name[:40]} (file {j + 1}/{num_files})", "", "", "")
+
+                        def folder_progress_cb(downloaded: int, total: int, rate: float, elapsed: float, _j: int = j, _n: int = num_files) -> None:
+                            if total <= 0:
+                                return
+                            file_progress = downloaded / total
+                            overall_progress = DOWNLOAD_START_PROGRESS + ((index - 1 + (_j + file_progress) / max(_n, 1)) / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
+                            if rate > 0:
+                                self._speed_history.append(rate)
+                                if len(self._speed_history) > self._max_speed_samples:
+                                    self._speed_history.pop(0)
+                            avg_rate = sum(self._speed_history) / len(self._speed_history) if self._speed_history else rate
+                            total_so_far = total_downloaded + downloaded
+                            total_size_text = f"{format_size(total_so_far)} / {format_size(total_size)}"
+                            eta_text = "--"
+                            if avg_rate > 0:
+                                remaining_bytes = total_size - total_so_far
+                                if remaining_bytes > 0:
+                                    eta_text = format_time(remaining_bytes / avg_rate)
+                            self._current_file_progress = f"{format_size(downloaded)} / {format_size(total)}"
+                            self.progress_signal.emit(overall_progress, (downloaded / total) * 100.0, "", format_speed(avg_rate), total_size_text, eta_text)
+
+                        ok, n, _ = download_file(file_url, out_path, size, progress_callback=folder_progress_cb)
+                        if ok:
+                            total_downloaded += n
+                            with self._lock:
+                                bytes_by_key[make_key(out_path, f"{game_name}:{rel}")] = n
+                        else:
+                            folder_ok = False
+                    if self._stop_requested or self.isInterruptionRequested():
+                        break
+                    if folder_ok:
+                        successful += 1
+                        self.log_signal.emit(f"✅ [{index}/{total_games}] {game_name} (folder) - {num_files} file(s)")
+                    else:
+                        failed += 1
+                        self.log_signal.emit(f"❌ [{index}/{total_games}] {game_name} - Some files failed")
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                self.progress_signal.emit(None, 0.0, "", "", "", "")
+                continue
+
+            filename = myrient_filename or (urllib.parse.unquote(url.split("/")[-1]).rstrip("/") if url else "") or f"download_{index}"
             output_path = download_dir / filename
             key = make_key(output_path, game_name)
 
@@ -2431,46 +2666,72 @@ class DownloadWorker(QtCore.QThread):
 
             # If already exists, skip and treat as success (match existing behaviour)
             if output_path.exists():
+                self.log_signal.emit(f"⏭️  [{index}/{total_games}] {game_name} - Already exists, skipping")
+                successful += 1
+                total_downloaded += file_size
                 with self._lock:
                     bytes_by_key[key] = file_size
-                    self._active_file_key = key
-
-                    now = time.time()
-                    if (now - self._last_progress_emit) >= PROGRESS_UPDATE_INTERVAL:
-                        self._last_progress_emit = now
-                        emit_progress_locked(now, current_key=key)
-
-                return True, True, game_name, file_size, 0.0
+                continue
 
             # Per-file progress callback (called from this worker thread)
             def progress_cb(downloaded: int, total: int, rate: float, elapsed: float) -> None:
-                now = time.time()
+                if total <= 0:
+                    return
+                file_progress = downloaded / total
+                current_percent = file_progress * 100.0
+                overall_progress = DOWNLOAD_START_PROGRESS + ((index - 1 + file_progress) / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
+                if rate > 0:
+                    self._speed_history.append(rate)
+                    if len(self._speed_history) > self._max_speed_samples:
+                        self._speed_history.pop(0)
+                avg_rate = sum(self._speed_history) / len(self._speed_history) if self._speed_history else rate
+                total_downloaded_so_far = total_downloaded + downloaded
+                total_size_text = f"{format_size(total_downloaded_so_far)} / {format_size(total_size)}"
+                eta_text = "--"
+                if avg_rate > 0:
+                    remaining_bytes = total_size - total_downloaded_so_far
+                    if remaining_bytes > 0:
+                        eta_text = format_time(remaining_bytes / avg_rate)
+                self._current_file_progress = f"{format_size(downloaded)} / {format_size(total)}"
                 with self._lock:
                     bytes_by_key[key] = downloaded
-                    self._active_file_key = key
+                self.progress_signal.emit(overall_progress, current_percent, "", format_speed(avg_rate), total_size_text, eta_text)
 
-                    # Global throttle so multiple threads don't spam signals
-                    if (now - self._last_progress_emit) >= PROGRESS_UPDATE_INTERVAL:
-                        self._last_progress_emit = now
-                        emit_progress_locked(now, current_key=key)
+            overall_progress = DOWNLOAD_START_PROGRESS + (index / max(total_games, 1)) * (DOWNLOAD_COMPLETE_PROGRESS - DOWNLOAD_START_PROGRESS)
+            self._current_file_progress = f"0 B / {format_size(file_size)}"
+            self.progress_signal.emit(overall_progress, 0.0, f"Downloading {index}/{total_games}: {game_name[:40]}", "", "", "")
+            self.log_signal.emit(f"[{index}/{total_games}] {game_name} ({format_size(file_size)})")
 
-            t0 = time.time()
-            success, downloaded_bytes, _ = download_file(
-                url,
-                output_path,
-                expected_size=file_size,
-                progress_callback=progress_cb,
-            )
-            t1 = time.time()
+            try:
+                success, downloaded_bytes, elapsed = download_file(
+                    url,
+                    output_path,
+                    expected_size=file_size,
+                    progress_callback=progress_cb,
+                )
+
+                if self._stop_requested or self.isInterruptionRequested():
+                    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
+                    break
+
+                self.progress_signal.emit(None, 0.0, "", "", "", "")
+            except Exception:  # noqa: BLE001
+                success = False
+                downloaded_bytes = 0
+                elapsed = 0.0
 
             # Final update for this file
             with self._lock:
                 if success:
                     bytes_by_key[key] = downloaded_bytes
                 self._active_file_key = key
-                emit_progress_locked(time.time(), current_key=key)
-
-            return success, False, game_name, downloaded_bytes, (t1 - t0)
+            return success, False, game_name, downloaded_bytes, elapsed
 
         # Initial UI state
         self.status_signal.emit("Downloading...")
@@ -2803,9 +3064,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "",  # We'll set rich text below
             False,
         )
+        # Configure subtitle with clickable link; store default for restoring when not RA
         igir_subtitle.setTextFormat(QtCore.Qt.RichText)
         igir_subtitle.setOpenExternalLinks(True)
-        igir_subtitle.setText(
+        self._igir_subtitle_default = (
             '<span style="color: #8a8a8a;">'
             'Enable this if you have pre-existing ROMs in your ROM directory — '
             'this will compare your ROMs directory against the DAT and only download missing files.'
@@ -2817,6 +3079,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'github.com/emmercm/igir/'
             '</a>'
         )
+        igir_subtitle.setText(self._igir_subtitle_default)
+        self._igir_subtitle = igir_subtitle
+        self._igir_title = igir_title
         options_layout.addWidget(igir_row)
 
         clean_row, self.clean_roms_check, self.clean_subtitle, self.clean_title_label = add_option_row(
@@ -3058,7 +3323,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_emitter = LogEmitter()
         self._log_emitter.log_signal.connect(self.append_log)
 
-        self.dat_edit.textChanged.connect(lambda: self._validate_field("dat"))
+        self._retroachievements_dat = False
+        self.dat_edit.textChanged.connect(lambda: (self._validate_field("dat"), self._update_igir_options_for_dat()))
         self.roms_edit.textChanged.connect(lambda: (self._validate_field("roms"), self._update_clean_roms_subtitle()))
         self.downloads_edit.textChanged.connect(lambda: self._validate_field("downloads"))
         # Myrient URL: only validate on focus loss/Enter (not every keystroke) to avoid network spam
@@ -3075,6 +3341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Now validate all fields with loaded values
         self._validate_all()
         self._update_clean_roms_subtitle()
+        self._update_igir_options_for_dat()
         self._on_use_igir_changed(self.use_igir_check.checkState())
 
     def append_log(self, text: str) -> None:
@@ -3195,6 +3462,33 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
 
+    def _update_igir_options_for_dat(self) -> None:
+        """If the selected DAT is a RetroAchievements DAT, disable IGIR/clean options and use simple fixdat matching."""
+        dat_path = resolve_path(self.dat_edit.text().strip())
+        if dat_path.exists() and dat_path.is_file() and is_retroachievements_dat(dat_path):
+            self._retroachievements_dat = True
+            self.use_igir_check.setChecked(False)
+            self.use_igir_check.setEnabled(False)
+            self.clean_roms_check.setChecked(False)
+            self.clean_roms_check.setEnabled(False)
+            self._igir_title.setEnabled(False)
+            self._igir_subtitle.setEnabled(False)
+            self.clean_title_label.setEnabled(False)
+            self.clean_subtitle.setEnabled(False)
+            self._igir_subtitle.setText(
+                '<span style="color: #8a8a8a;">'
+                "RetroAchievements DAT selected — using simple fixdat matching; IGIR is skipped."
+                "</span>"
+            )
+        else:
+            self._retroachievements_dat = False
+            self._igir_subtitle.setText(self._igir_subtitle_default)
+            self.use_igir_check.setEnabled(True)
+            self._igir_title.setEnabled(True)
+            self._igir_subtitle.setEnabled(True)
+            self.clean_subtitle.setEnabled(True)
+            self._on_use_igir_changed(self.use_igir_check.checkState())
+
     def _on_use_igir_changed(self, state: int) -> None:
         is_checked = state == QtCore.Qt.Checked
         if is_checked:
@@ -3250,24 +3544,47 @@ class MainWindow(QtWidgets.QMainWindow):
         url = self.myrient_edit.text().strip()
         if url:
             config_snapshot["myrient_base_url"] = url
-
-        config_snapshot["clean_roms"] = self.clean_roms_check.isChecked()
         config_snapshot["select_downloads"] = self.select_downloads_check.isChecked()
-        use_igir = self.use_igir_check.isChecked()
 
-        # Check ROM directory and create NOTHINGTOCLEAN file if empty
-        roms_dir = Path(config_snapshot["roms_directory"])
-        if roms_dir.exists() and roms_dir.is_dir():
-            try:
-                has_files = any(item.is_file() for item in roms_dir.iterdir())
-                if not has_files:
-                    not_required_dir = roms_dir / NOT_REQUIRED_DIR
-                    not_required_dir.mkdir(exist_ok=True)
-                    nothing_to_clean_file = not_required_dir / "NOTHINGTOCLEAN"
-                    nothing_to_clean_file.touch()
-                    print(f"📁 Created {nothing_to_clean_file} (ROM directory was empty)")
-            except (OSError, PermissionError) as e:
-                print(f"⚠️  Could not check/create NOTHINGTOCLEAN file: {e}")
+        # RetroAchievements DATs always use simple fixdat matching; skip IGIR
+        if getattr(self, "_retroachievements_dat", False):
+            use_igir = False
+            config_snapshot["clean_roms"] = False
+        else:
+            config_snapshot["clean_roms"] = self.clean_roms_check.isChecked()
+            use_igir = self.use_igir_check.isChecked()
+
+        # When using fixdat (no IGIR), ask about clones if DAT has parent/clone relationships
+        if not use_igir:
+            dat_path = resolve_path(self.dat_edit.text().strip())
+            if dat_path.exists() and dat_path.is_file() and dat_has_clones(dat_path):
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Clones Detected in this DAT",
+                    "Do you want to include clones in this download?\n\nIf you're aiming for 1G1R — click No.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                config_snapshot["include_clones"] = reply == QtWidgets.QMessageBox.Yes
+            else:
+                config_snapshot["include_clones"] = True
+        else:
+            config_snapshot["include_clones"] = True
+
+        # When using IGIR, create NotRequired/NOTHINGTOCLEAN if ROM directory is empty (IGIR clean expects this)
+        if use_igir:
+            roms_dir = Path(config_snapshot["roms_directory"])
+            if roms_dir.exists() and roms_dir.is_dir():
+                try:
+                    has_files = any(item.is_file() for item in roms_dir.iterdir())
+                    if not has_files:
+                        not_required_dir = roms_dir / NOT_REQUIRED_DIR
+                        not_required_dir.mkdir(exist_ok=True)
+                        nothing_to_clean_file = not_required_dir / "NOTHINGTOCLEAN"
+                        nothing_to_clean_file.touch()
+                        print(f"📁 Created {nothing_to_clean_file} (ROM directory was empty)")
+                except (OSError, PermissionError) as e:
+                    print(f"⚠️  Could not check/create NOTHINGTOCLEAN file: {e}")
 
         self._start_mcfd_worker(config_snapshot, use_igir)
 
