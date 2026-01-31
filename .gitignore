@@ -39,6 +39,13 @@ reports/
 igir/
 fixdat_temp.dat
 
+# Local tooling / env files
+.venv/
+.python-version
+pyproject.toml
+uv.lock
+Myrient-Can-FixDAT/
+
 # PyInstaller artifacts
 *.manifest
 
