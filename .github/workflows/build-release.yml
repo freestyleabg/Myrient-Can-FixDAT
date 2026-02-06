@@ -5,6 +5,22 @@ on:
     tags:
       - 'v*'  # Triggers on tags like v1.0.0, v2.1.3, etc.
   workflow_dispatch:  # Allows manual triggering from GitHub Actions UI
+    inputs:
+      create_release:
+        description: "Create/Update GitHub Release with built assets"
+        required: false
+        default: false
+        type: boolean
+      release_name:
+        description: "Release name (optional; defaults to tag)"
+        required: false
+        default: ""
+        type: string
+      release_tag:
+        description: "Release tag (optional; defaults to existing tag or auto-generated for manual runs)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write  # Required to create releases
@@ -45,17 +61,21 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent dist/MyrientCanFixDAT.app dist/MyrientCanFixDAT-macos.zip
 
       - name: Upload Release Asset (Windows)
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')) && runner.os == 'Windows'
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-{0}', github.run_number)) }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-{0}', github.run_number))) }}
           files: dist/MyrientCanFixDAT.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Release Asset (macOS)
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')) && runner.os == 'macOS'
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-{0}', github.run_number)) }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-{0}', github.run_number))) }}
           files: dist/MyrientCanFixDAT-macos.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
