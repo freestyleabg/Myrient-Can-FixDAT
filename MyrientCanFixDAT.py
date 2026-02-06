@@ -84,12 +84,14 @@ HTTP_USER_AGENT = "MyrientCanFixDAT/1.0"
 DEFAULT_MAX_DOWNLOAD_WORKERS = 4
 
 # UI constants
-WINDOW_MIN_WIDTH = 1200
+WINDOW_DEFAULT_WIDTH = 1200
+WINDOW_MIN_WIDTH = 1080
 WINDOW_HEIGHT = 1000
 TITLE_BAR_HEIGHT = 32
-BUTTON_HEIGHT = 32
+BUTTON_HEIGHT = 30
 STATUS_INDICATOR_WIDTH = 24
 LOG_FONT_SIZE = 11
+USE_FRAMELESS_WINDOWS = False
 
 # Progress constants
 CONFIG_VALIDATION_PROGRESS = 1.0
@@ -178,8 +180,8 @@ QPushButton#titleButtonClose:hover { background-color: #e81123; color: #ffffff; 
 QGroupBox {
     border: 1px solid #3c3c46;
     border-radius: 6px;
-    margin-top: 8px;
-    padding-top: 14px;
+    margin-top: 6px;
+    padding-top: 10px;
     font-weight: bold;
 }
 QGroupBox::title {
@@ -224,7 +226,7 @@ QPushButton {
     background-color: #2f3645;
     border: 1px solid #4a5265;
     border-radius: 4px;
-    padding: 5px 14px;
+    padding: 4px 12px;
     color: #f0f0f5;
 }
 QPushButton:hover { background-color: #3a4356; }
@@ -235,7 +237,7 @@ QPushButton#primaryRunButton {
     border: 1px solid #7ab3ff;
     color: #0b1020;
     font-weight: 600;
-    padding: 6px 18px;
+    padding: 5px 16px;
 }
 QPushButton#primaryRunButton:hover { background-color: #6cb0ff; }
 QPushButton#primaryRunButton:pressed { background-color: #4a8fe0; }
@@ -244,7 +246,7 @@ QPushButton#stopButton {
     background-color: #dc3545;
     border: 1px solid #c82333;
     border-radius: 4px;
-    padding: 5px 14px;
+    padding: 4px 12px;
     color: #ffffff;
     font-weight: 600;
 }
@@ -262,7 +264,7 @@ QProgressBar {
     text-align: center;
     background-color: #18181f;
     color: #e6e6eb;
-    min-height: 32px;
+    min-height: 28px;
     font-size: 11px;
     font-weight: 600;
 }
@@ -276,8 +278,8 @@ QWidget#metricBox {
     background-color: #1a1c23;
     border: 1px solid #444454;
     border-radius: 4px;
-    min-width: 140px;
-    max-width: 160px;
+    min-width: 126px;
+    max-width: 150px;
     padding: 2px;
 }
 
@@ -2081,6 +2083,35 @@ class TitleBar(QtWidgets.QWidget):
         super().mouseReleaseEvent(event)
 
 
+class MoveAnywhereFilter(QtCore.QObject):
+    """Allow moving a frameless window by Alt+left-drag from any child widget."""
+
+    def __init__(self, window: QtWidgets.QWidget) -> None:
+        super().__init__(window)
+        self._window = window
+        self._drag_offset: Optional[QtCore.QPoint] = None
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if not isinstance(event, QtGui.QMouseEvent):
+            return False
+
+        if event.type() == QtCore.QEvent.MouseButtonPress:
+            if event.button() == QtCore.Qt.LeftButton and (event.modifiers() & QtCore.Qt.AltModifier):
+                self._drag_offset = event.globalPos() - self._window.frameGeometry().topLeft()
+                return True
+
+        elif event.type() == QtCore.QEvent.MouseMove:
+            if self._drag_offset is not None and (event.buttons() & QtCore.Qt.LeftButton):
+                self._window.move(event.globalPos() - self._drag_offset)
+                return True
+
+        elif event.type() == QtCore.QEvent.MouseButtonRelease:
+            if event.button() == QtCore.Qt.LeftButton:
+                self._drag_offset = None
+
+        return False
+
+
 class _MyrientOverrideReceiver(QtCore.QObject):
     """Lives in worker thread; receives override URL from main window and quits the worker's event loop."""
 
@@ -2975,15 +3006,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Myrient Can FixDAT")
-        self.resize(WINDOW_MIN_WIDTH, WINDOW_HEIGHT)
+        self.resize(WINDOW_DEFAULT_WIDTH, WINDOW_HEIGHT)
         self.setMinimumWidth(WINDOW_MIN_WIDTH)
 
-        self.setWindowFlags(
-            QtCore.Qt.FramelessWindowHint
-            | QtCore.Qt.Window
-            | QtCore.Qt.WindowSystemMenuHint
-            | QtCore.Qt.WindowMinimizeButtonHint
-        )
+        if USE_FRAMELESS_WINDOWS:
+            self.setWindowFlags(
+                QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.Window
+                | QtCore.Qt.WindowSystemMenuHint
+                | QtCore.Qt.WindowMinimizeButtonHint
+            )
+        else:
+            self.setWindowFlags(
+                QtCore.Qt.Window
+                | QtCore.Qt.WindowSystemMenuHint
+                | QtCore.Qt.WindowMinMaxButtonsHint
+                | QtCore.Qt.WindowCloseButtonHint
+            )
 
         self._apply_dark_theme()
 
@@ -2991,16 +3030,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_requested_once = False
         self._last_eta = ""
         self._myrient_url_cache: Dict[str, bool] = {}  # Cache for URL validation results
+        if USE_FRAMELESS_WINDOWS:
+            self._size_grip = QtWidgets.QSizeGrip(self)
+            self._size_grip.setFixedSize(18, 18)
+            self._size_grip.raise_()
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
 
         main_layout = QtWidgets.QVBoxLayout(central)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
 
-        title_bar = TitleBar(self)
-        main_layout.addWidget(title_bar)
+        if USE_FRAMELESS_WINDOWS:
+            title_bar = TitleBar(self)
+            main_layout.addWidget(title_bar)
 
         # Initialize UI elements
         self.dat_edit = QtWidgets.QLineEdit()
@@ -3023,6 +3067,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         paths_group = QtWidgets.QGroupBox("Paths")
         paths_layout = QtWidgets.QGridLayout(paths_group)
+        paths_layout.setContentsMargins(8, 2, 8, 8)
+        paths_layout.setHorizontalSpacing(8)
+        paths_layout.setVerticalSpacing(6)
         paths_layout.setColumnStretch(1, 1)
         row = 0
 
@@ -3035,6 +3082,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dat_subtitle.setStyleSheet("color: gray; font-size: 10px;")
 
         dat_label_layout = QtWidgets.QVBoxLayout()
+        dat_label_layout.setContentsMargins(0, 0, 0, 0)
+        dat_label_layout.setSpacing(1)
         dat_label_layout.addWidget(dat_label)
         dat_label_layout.addWidget(dat_subtitle)
         dat_label_container = QtWidgets.QWidget()
@@ -3044,10 +3093,10 @@ class MainWindow(QtWidgets.QMainWindow):
         paths_layout.addWidget(self.dat_edit, row, 1)
 
         dat_buttons_container = QtWidgets.QWidget()
-        dat_buttons_container.setMinimumWidth(200)
+        dat_buttons_container.setMinimumWidth(180)
         dat_buttons_layout = QtWidgets.QHBoxLayout(dat_buttons_container)
         dat_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        dat_buttons_layout.setSpacing(6)
+        dat_buttons_layout.setSpacing(5)
 
         dat_browse_btn = QtWidgets.QPushButton("Browse")
         dat_browse_btn.clicked.connect(self._browse_dat)
@@ -3077,6 +3126,8 @@ class MainWindow(QtWidgets.QMainWindow):
             sub.setStyleSheet("color: gray; font-size: 10px;")
 
             label_layout = QtWidgets.QVBoxLayout()
+            label_layout.setContentsMargins(0, 0, 0, 0)
+            label_layout.setSpacing(1)
             label_layout.addWidget(lbl)
             label_layout.addWidget(sub)
 
@@ -3084,7 +3135,7 @@ class MainWindow(QtWidgets.QMainWindow):
             label_container.setLayout(label_layout)
 
             browse_btn = QtWidgets.QPushButton("Browse")
-            browse_btn.setMinimumWidth(200)
+            browse_btn.setMinimumWidth(180)
             browse_btn.clicked.connect(browse_slot)
 
             paths_layout.addWidget(label_container, row, 0)
@@ -3104,6 +3155,8 @@ class MainWindow(QtWidgets.QMainWindow):
         url_subtitle.setStyleSheet("color: gray; font-size: 10px;")
 
         url_label_layout = QtWidgets.QVBoxLayout()
+        url_label_layout.setContentsMargins(0, 0, 0, 0)
+        url_label_layout.setSpacing(1)
         url_label_layout.addWidget(url_label)
         url_label_layout.addWidget(url_subtitle)
         url_label_container = QtWidgets.QWidget()
@@ -3117,12 +3170,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         options_group = QtWidgets.QGroupBox("Options")
         options_layout = QtWidgets.QVBoxLayout(options_group)
-        options_layout.setSpacing(8)
-        options_layout.setContentsMargins(9, 0, 9, 9)
+        options_layout.setSpacing(6)
+        options_layout.setContentsMargins(8, 0, 8, 8)
 
         def add_option_row(title_text: str, subtitle_text: str, initial_checked: bool = False):
             row_container = QtWidgets.QWidget()
             row_layout = QtWidgets.QHBoxLayout(row_container)
+            row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(6)
 
             checkbox = CustomCheckBox()
@@ -3131,6 +3185,7 @@ class MainWindow(QtWidgets.QMainWindow):
             text_container = QtWidgets.QWidget()
             text_layout = QtWidgets.QVBoxLayout(text_container)
             text_layout.setContentsMargins(0, 0, 0, 0)
+            text_layout.setSpacing(1)
 
             title_label = QtWidgets.QLabel(title_text)
             tf = title_label.font()
@@ -3192,7 +3247,8 @@ class MainWindow(QtWidgets.QMainWindow):
         threads_row = QtWidgets.QWidget()
         threads_row.setLayoutDirection(QtCore.Qt.LeftToRight)
         threads_layout = QtWidgets.QHBoxLayout(threads_row)
-        threads_layout.setSpacing(6)
+        threads_layout.setContentsMargins(0, 0, 0, 0)
+        threads_layout.setSpacing(5)
 
         threads_spin = QtWidgets.QSpinBox()
         threads_spin.setRange(1, 16)
@@ -3226,8 +3282,8 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(options_group)
 
         buttons_layout = QtWidgets.QHBoxLayout()
-        buttons_layout.setContentsMargins(10, 16, 10, 16)
-        buttons_layout.setSpacing(12)
+        buttons_layout.setContentsMargins(8, 10, 8, 10)
+        buttons_layout.setSpacing(10)
 
         self.run_button = QtWidgets.QPushButton("Run")
         self.run_button.setObjectName("primaryRunButton")
@@ -3252,11 +3308,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         runtime_group = QtWidgets.QGroupBox("Run")
         runtime_layout = QtWidgets.QVBoxLayout(runtime_group)
-        runtime_layout.setContentsMargins(10, 8, 10, 10)
-        runtime_layout.setSpacing(10)
+        runtime_layout.setContentsMargins(8, 6, 8, 8)
+        runtime_layout.setSpacing(8)
 
         status_layout = QtWidgets.QHBoxLayout()
-        status_layout.setContentsMargins(8, 6, 8, 6)
+        status_layout.setContentsMargins(6, 4, 6, 4)
         status_layout.setSpacing(6)
 
         status_label = QtWidgets.QLabel("Status:")
@@ -3279,12 +3335,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overall_progress = QtWidgets.QProgressBar()
         self.overall_progress.setRange(0, 100)
         self.overall_progress.setFormat("%p%")
-        self.overall_progress.setMinimumHeight(32)
+        self.overall_progress.setMinimumHeight(28)
 
         self.current_file_progress = QtWidgets.QProgressBar()
         self.current_file_progress.setRange(0, 100)
         self.current_file_progress.setFormat("%p%")
-        self.current_file_progress.setMinimumHeight(32)
+        self.current_file_progress.setMinimumHeight(28)
 
         # Initialize download tracking variables
         self._total_downloaded = 0
@@ -3301,14 +3357,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Create main vertical layout for progress bars and their aligned metrics
         progress_section = QtWidgets.QVBoxLayout()
-        progress_section.setSpacing(12)
+        progress_section.setSpacing(8)
 
         # First row: Overall progress bar with Total and Time Remaining
         overall_row = QtWidgets.QHBoxLayout()
-        overall_row.setSpacing(12)
+        overall_row.setSpacing(8)
 
         # Overall progress bar (taller)
-        self.overall_progress.setMinimumHeight(32)
+        self.overall_progress.setMinimumHeight(28)
         self._total_size = 0  # Will be updated during download
         overall_row.addWidget(self.overall_progress, 1)  # Give it stretch priority
 
@@ -3352,10 +3408,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_file_row_container = QtWidgets.QWidget()
         file_row = QtWidgets.QHBoxLayout(self.current_file_row_container)
         file_row.setContentsMargins(0, 0, 0, 0)
-        file_row.setSpacing(12)
+        file_row.setSpacing(8)
 
         # Current file progress bar (taller)
-        self.current_file_progress.setMinimumHeight(32)
+        self.current_file_progress.setMinimumHeight(28)
         file_row.addWidget(self.current_file_progress, 1)  # Give it stretch priority
 
         # Current file progress metric box (shows downloaded / total for current file)
@@ -3402,7 +3458,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread_progress_container = QtWidgets.QWidget()
         self.thread_progress_layout = QtWidgets.QVBoxLayout(self.thread_progress_container)
         self.thread_progress_layout.setContentsMargins(0, 0, 0, 0)
-        self.thread_progress_layout.setSpacing(6)
+        self.thread_progress_layout.setSpacing(4)
         self.thread_progress_bars: List[QtWidgets.QProgressBar] = []
         self.thread_progress_labels: List[QtWidgets.QLabel] = []
 
@@ -3415,7 +3471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lf = log_label.font()
         lf.setBold(True)
         log_label.setFont(lf)
-        log_label.setContentsMargins(0, 8, 0, 0)
+        log_label.setContentsMargins(0, 4, 0, 0)
         runtime_layout.addWidget(log_label)
 
         self.log_edit = QtWidgets.QPlainTextEdit()
@@ -3451,6 +3507,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_clean_roms_subtitle()
         self._update_igir_options_for_dat()
         self._on_use_igir_changed(self.use_igir_check.checkState())
+
+        if USE_FRAMELESS_WINDOWS:
+            # Window recovery helpers for frameless mode.
+            self._move_anywhere_filter = MoveAnywhereFilter(self)
+            self._install_move_filter(central)
+
+            self._reset_geometry_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+R"), self)
+            self._reset_geometry_shortcut.activated.connect(self._reset_window_geometry)
+            self._reset_geometry_shortcut_alt = QtWidgets.QShortcut(QtGui.QKeySequence("Alt+Shift+R"), self)
+            self._reset_geometry_shortcut_alt.activated.connect(self._reset_window_geometry)
+
+    def _install_move_filter(self, root: QtWidgets.QWidget) -> None:
+        root.installEventFilter(self._move_anywhere_filter)
+        for child in root.findChildren(QtWidgets.QWidget):
+            child.installEventFilter(self._move_anywhere_filter)
+
+    def _reset_window_geometry(self) -> None:
+        self.showNormal()
+        self.resize(WINDOW_DEFAULT_WIDTH, WINDOW_HEIGHT)
+
+        screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if USE_FRAMELESS_WINDOWS and hasattr(self, "_size_grip"):
+            margin = 2
+            self._size_grip.move(
+                max(margin, self.width() - self._size_grip.width() - margin),
+                max(margin, self.height() - self._size_grip.height() - margin),
+            )
 
     def append_log(self, text: str) -> None:
         if not text:
@@ -4152,11 +4247,18 @@ class DatDownloadDialog(QtWidgets.QDialog):
         self.setWindowTitle("Download DAT from RetroAchievements" if mode == "retroachievements" else "Download DAT from Fresh 1G1R")
         self.resize(650, 550)
 
-        self.setWindowFlags(
-            QtCore.Qt.FramelessWindowHint
-            | QtCore.Qt.Dialog
-            | QtCore.Qt.WindowSystemMenuHint
-        )
+        if USE_FRAMELESS_WINDOWS:
+            self.setWindowFlags(
+                QtCore.Qt.FramelessWindowHint
+                | QtCore.Qt.Dialog
+                | QtCore.Qt.WindowSystemMenuHint
+            )
+        else:
+            self.setWindowFlags(
+                QtCore.Qt.Dialog
+                | QtCore.Qt.WindowSystemMenuHint
+                | QtCore.Qt.WindowCloseButtonHint
+            )
 
         palette = self.palette()
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor(42, 43, 51))
@@ -4166,13 +4268,19 @@ class DatDownloadDialog(QtWidgets.QDialog):
 
         self.selected_dat_path: Optional[Path] = None
         self._dat_files: List[dict] = []
+        if USE_FRAMELESS_WINDOWS:
+            self._size_grip = QtWidgets.QSizeGrip(self)
+            self._size_grip.setFixedSize(18, 18)
+            self._size_grip.raise_()
+            self._move_anywhere_filter = MoveAnywhereFilter(self)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        title_bar = TitleBar(self)
-        layout.addWidget(title_bar)
+        if USE_FRAMELESS_WINDOWS:
+            title_bar = TitleBar(self)
+            layout.addWidget(title_bar)
 
         content = QtWidgets.QWidget(self)
         content.setObjectName("dialogPanel")
@@ -4305,6 +4413,10 @@ class DatDownloadDialog(QtWidgets.QDialog):
         ):
             btn.toggled.connect(lambda checked, b=btn: self._on_segment_toggled(b, checked))
 
+        if USE_FRAMELESS_WINDOWS:
+            for child in self.findChildren(QtWidgets.QWidget):
+                child.installEventFilter(self._move_anywhere_filter)
+
         self._refresh_list()
 
     def _current_type(self) -> str:
@@ -4390,6 +4502,15 @@ class DatDownloadDialog(QtWidgets.QDialog):
 
         if self._dat_files:
             self.dat_list.setCurrentRow(0)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if USE_FRAMELESS_WINDOWS and hasattr(self, "_size_grip"):
+            margin = 2
+            self._size_grip.move(
+                max(margin, self.width() - self._size_grip.width() - margin),
+                max(margin, self.height() - self._size_grip.height() - margin),
+            )
 
     def _show_error_dialog(self, title: str, message: str) -> None:
         """Show an error dialog with a copy button to copy the error message."""
