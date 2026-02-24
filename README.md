@@ -4,7 +4,26 @@
 
 A GUI tool that downloads missing ROMs from Myrient to complete your game collection. Point it at your existing ROMs, give it a DAT file describing your desired collection, and it will download only what you're missing. Includes built-in DAT downloaders for daily [Fresh1G1R](https://github.com/UnluckyForSome/Fresh1G1R) 1G1R sets and [RetroAchievements](https://github.com/UltraGodAzgorath/Unofficial-RA-DATs) DATs.
 
-![Can FixDAT Screenshot](.github/MyrientCanFixDat.PNG)
+![Can FixDAT Screenshot](.github/CanFixDAT.png)
+
+## Apps In This Repo
+
+This repository ships two separate desktop apps:
+
+- **CanFixDAT** (`CanFixDAT.py`) - download/fix DAT-based collections from Myrient.
+- **ESDE ROM Formatter** (`esde_rom_formatter_gui.py`) - format ROM folders for ES-DE directories-interpreted-as-files + M3U workflows.
+
+## Releases And Tags
+
+Releases are intentionally split by tag prefix:
+
+- **CanFixDAT releases:** tag as `fixdat-vX.Y.Z` (example: `fixdat-v1.1.0`)
+- **ESDE ROM Formatter releases:** tag as `formatter-vX.Y` or `formatter-vX.Y.Z` (example: `formatter-v0.1`)
+
+When downloading from the Releases page, pick assets by filename:
+
+- CanFixDAT: `CanFixDAT.exe` / `CanFixDAT-macos.zip`
+- Formatter: `ESDE-ROM-Formatter.exe` / `ESDE-ROM-Formatter-macos.zip`
 
 ## ✨ Features
 
@@ -17,15 +36,16 @@ A GUI tool that downloads missing ROMs from Myrient to complete your game collec
 
 ### Option 1: Standalone Executable
 
-For convenience, a prebuilt [`CanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/CanFixDAT.exe) is provided in the Releases section. It is generated directly from this repository's Python source using PyInstaller, which bundles the app and Python runtime into a single executable.
+For convenience, prebuilt binaries are provided in the Releases section. They are generated directly from this repository's Python source using PyInstaller.
 
-🔍 You can review the source used to build the executable here: [`MyrientCanFixDAT.py`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/blob/main/MyrientCanFixDAT.py).
+🔍 You can review the source used to build CanFixDAT here: [`CanFixDAT.py`](https://github.com/freestyleabg/Myrient-Can-FixDAT/blob/main/CanFixDAT.py).
 
 
 **Steps:**
-1. 📦 Download [`CanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/CanFixDAT.exe) from the **Releases** page  
-2. ▶️ Run the `.exe` — required directories will be created alongside it  
-3. ⚙️ Configure your paths and click **Run**
+1. 📦 Open the [Releases page](https://github.com/freestyleabg/Myrient-Can-FixDAT/releases)  
+2. 📦 Download the correct asset (`CanFixDAT.exe` for this app)  
+3. ▶️ Run the `.exe` — required directories will be created alongside it  
+4. ⚙️ Configure your paths and click **Run**
 
 ### Option 2: Run from Python 🐍
 
@@ -33,14 +53,14 @@ If you prefer more transparency and running from source:
 
 ```bash
 # Clone the repository
-git clone https://github.com/UnluckyForSome/Myrient-Can-FixDAT.git
+git clone https://github.com/freestyleabg/Myrient-Can-FixDAT.git
 cd Myrient-Can-FixDAT
 
 # Install dependencies
 pip install PyQt5 requests lxml
 
 # Run the application
-python MyrientCanFixDAT.py
+python CanFixDAT.py
 ```
 
 **Requirements:** Python 3.7+

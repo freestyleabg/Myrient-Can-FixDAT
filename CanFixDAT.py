@@ -3608,7 +3608,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.extract_archives_title_label = extract_title
         self.extract_archives_subtitle_label = extract_subtitle
-        options_layout.addWidget(extract_row)
 
         extract_mode_row, self.extract_to_subfolder_check, extract_mode_subtitle, extract_mode_title = add_option_row(
             "Extract Into Archive-Named Subfolder",
@@ -3617,7 +3616,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.extract_mode_title_label = extract_mode_title
         self.extract_mode_subtitle_label = extract_mode_subtitle
-        options_layout.addWidget(extract_mode_row)
 
         delete_archive_row, self.delete_archive_after_extract_check, delete_archive_subtitle, delete_archive_title = add_option_row(
             "Delete Archive After Successful Extraction",
@@ -3626,7 +3624,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.delete_archive_title_label = delete_archive_title
         self.delete_archive_subtitle_label = delete_archive_subtitle
-        options_layout.addWidget(delete_archive_row)
 
         esde_post_row, self.postprocess_esde_m3u_check, esde_post_subtitle, esde_post_title = add_option_row(
             "Post-Process Extracted Files for ES-DE .m3u Layout",
@@ -3635,7 +3632,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.esde_post_title_label = esde_post_title
         self.esde_post_subtitle_label = esde_post_subtitle
-        options_layout.addWidget(esde_post_row)
 
         # Download Threads (Option Row)
         threads_row = QtWidgets.QWidget()
@@ -3670,6 +3666,10 @@ class MainWindow(QtWidgets.QMainWindow):
         threads_layout.addStretch()
 
         options_layout.addWidget(threads_row)
+        options_layout.addWidget(extract_row)
+        options_layout.addWidget(extract_mode_row)
+        options_layout.addWidget(delete_archive_row)
+        options_layout.addWidget(esde_post_row)
 
         self.download_threads_spin = threads_spin
 

@@ -48,12 +48,12 @@ jobs:
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --name CanFixDAT MyrientCanFixDAT.py
+          pyinstaller --onefile --windowed --name CanFixDAT CanFixDAT.py
 
       - name: Build app bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --name CanFixDAT MyrientCanFixDAT.py
+          pyinstaller --windowed --name CanFixDAT CanFixDAT.py
 
       - name: Package macOS app
         if: runner.os == 'macOS'
