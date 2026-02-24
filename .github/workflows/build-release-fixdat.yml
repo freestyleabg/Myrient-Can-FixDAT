@@ -48,12 +48,12 @@ jobs:
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --icon .github/icon_white.png --name CanFixDAT CanFixDAT.py
+          pyinstaller --onefile --windowed --icon .github/icon_white.png --add-data ".github/icon_white.png;.github" --name CanFixDAT CanFixDAT.py
 
       - name: Build app bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --name CanFixDAT CanFixDAT.py
+          pyinstaller --windowed --add-data ".github/icon_white.png:.github" --name CanFixDAT CanFixDAT.py
 
       - name: Package macOS app
         if: runner.os == 'macOS'

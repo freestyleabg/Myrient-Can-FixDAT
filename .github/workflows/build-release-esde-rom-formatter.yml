@@ -48,12 +48,12 @@ jobs:
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --icon .github/icon_white.png --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
+          pyinstaller --onefile --windowed --icon .github/icon_white.png --add-data ".github/icon_white.png;.github" --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
 
       - name: Build app bundle (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
+          pyinstaller --windowed --add-data ".github/icon_white.png:.github" --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
 
       - name: Package macOS app
         if: runner.os == 'macOS'

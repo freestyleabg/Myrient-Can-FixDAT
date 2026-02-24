@@ -380,11 +380,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
-    app_icon_path = Path(__file__).resolve().parent / ".github" / "icon_white.png"
-    if app_icon_path.exists():
+    app_icon_path: Path | None = None
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            p = Path(meipass) / ".github" / "icon_white.png"
+            if p.exists():
+                app_icon_path = p
+    if app_icon_path is None:
+        p = Path(__file__).resolve().parent / ".github" / "icon_white.png"
+        if p.exists():
+            app_icon_path = p
+    if app_icon_path and app_icon_path.exists():
         app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window = MainWindow()
-    if app_icon_path.exists():
+    if app_icon_path and app_icon_path.exists():
         window.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window.show()
     return app.exec_()

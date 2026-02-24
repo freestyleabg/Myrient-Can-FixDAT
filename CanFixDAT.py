@@ -5038,8 +5038,21 @@ class DatDownloadDialog(QtWidgets.QDialog):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
-    app_icon_path = SCRIPT_DIR / ".github" / "icon_white.png"
-    if app_icon_path.exists():
+
+    def _resolve_app_icon_path() -> Optional[Path]:
+        candidates: List[Path] = []
+        if getattr(sys, "frozen", False):
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / ".github" / "icon_white.png")
+        candidates.append(SCRIPT_DIR / ".github" / "icon_white.png")
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    app_icon_path = _resolve_app_icon_path()
+    if app_icon_path and app_icon_path.exists():
         app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
 
     # Palette for native dialogs / overall app
@@ -5063,7 +5076,7 @@ def main() -> None:
     app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow()
-    if app_icon_path.exists():
+    if app_icon_path and app_icon_path.exists():
         window.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window.show()
     sys.exit(app.exec_())
