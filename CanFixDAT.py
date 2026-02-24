@@ -107,7 +107,7 @@ TITLE_BAR_HEIGHT = 32
 BUTTON_HEIGHT = 30
 STATUS_INDICATOR_WIDTH = 24
 LOG_FONT_SIZE = 11
-USE_FRAMELESS_WINDOWS = False
+USE_FRAMELESS_WINDOWS = sys.platform.startswith("win")
 
 # Progress constants
 CONFIG_VALIDATION_PROGRESS = 1.0
@@ -2082,13 +2082,27 @@ class TitleBar(QtWidgets.QWidget):
         self.min_button.setFixedSize(28, 22)
         self.min_button.clicked.connect(self._window.showMinimized)  # type: ignore[attr-defined]
 
+        self.max_button = QtWidgets.QPushButton("□")
+        self.max_button.setObjectName("titleButton")
+        self.max_button.setFixedSize(28, 22)
+        self.max_button.clicked.connect(self._toggle_max_restore)
+
         self.close_button = QtWidgets.QPushButton("×")
         self.close_button.setObjectName("titleButtonClose")
         self.close_button.setFixedSize(28, 22)
         self.close_button.clicked.connect(self._window.close)  # type: ignore[attr-defined]
 
         layout.addWidget(self.min_button)
+        layout.addWidget(self.max_button)
         layout.addWidget(self.close_button)
+
+    def _toggle_max_restore(self) -> None:
+        if self._window.isMaximized():
+            self._window.showNormal()
+            self.max_button.setText("□")
+        else:
+            self._window.showMaximized()
+            self.max_button.setText("❐")
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
         if event.button() == QtCore.Qt.LeftButton:
@@ -2098,6 +2112,10 @@ class TitleBar(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
         if self._drag_pos is not None and (event.buttons() & QtCore.Qt.LeftButton):
+            if self._window.isMaximized():
+                self._window.showNormal()
+                self.max_button.setText("□")
+                self._drag_pos = event.globalPos() - self._window.frameGeometry().topLeft()  # type: ignore[attr-defined]
             self._window.move(event.globalPos() - self._drag_pos)  # type: ignore[attr-defined]
             event.accept()
         super().mouseMoveEvent(event)
@@ -2105,6 +2123,13 @@ class TitleBar(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
         self._drag_pos = None
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == QtCore.Qt.LeftButton:
+            self._toggle_max_restore()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class MoveAnywhereFilter(QtCore.QObject):
@@ -3373,6 +3398,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 | QtCore.Qt.Window
                 | QtCore.Qt.WindowSystemMenuHint
                 | QtCore.Qt.WindowMinimizeButtonHint
+                | QtCore.Qt.WindowMinMaxButtonsHint
+                | QtCore.Qt.WindowCloseButtonHint
             )
         else:
             self.setWindowFlags(
@@ -3402,6 +3429,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if USE_FRAMELESS_WINDOWS:
             title_bar = TitleBar(self)
+            self._title_bar = title_bar
             main_layout.addWidget(title_bar)
 
         # Initialize UI elements
@@ -3934,10 +3962,21 @@ class MainWindow(QtWidgets.QMainWindow):
         frame.moveCenter(available.center())
         self.move(frame.topLeft())
 
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if not USE_FRAMELESS_WINDOWS:
+            return
+        if event.type() == QtCore.QEvent.WindowStateChange:
+            if hasattr(self, "_size_grip"):
+                self._size_grip.setVisible(not self.isMaximized())
+            if hasattr(self, "_title_bar"):
+                self._title_bar.max_button.setText("❐" if self.isMaximized() else "□")
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         if USE_FRAMELESS_WINDOWS and hasattr(self, "_size_grip"):
             margin = 2
+            self._size_grip.setVisible(not self.isMaximized())
             self._size_grip.move(
                 max(margin, self.width() - self._size_grip.width() - margin),
                 max(margin, self.height() - self._size_grip.height() - margin),
