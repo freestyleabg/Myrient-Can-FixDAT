@@ -41,10 +41,15 @@ from PyQt5.QtCore import QSettings
 
 # Optional integration with ESDE ROM Formatter post-processing tool.
 try:
-    from esde_rom_formatter_core import build_plans as esde_build_plans, execute_plan as esde_execute_plan
+    from esde_rom_formatter_core import (
+        build_plans as esde_build_plans,
+        execute_plan as esde_execute_plan,
+        postprocess_single_disc_folders as esde_postprocess_single_disc_folders,
+    )
 except ImportError:
     esde_build_plans = None  # type: ignore[assignment]
     esde_execute_plan = None  # type: ignore[assignment]
+    esde_postprocess_single_disc_folders = None  # type: ignore[assignment]
 
 # Optional HTML parser (recommended). If missing, we fall back to a simpler regex parser.
 try:
@@ -70,6 +75,7 @@ SETTING_EXTRACT_ARCHIVES = "extract_archives"
 SETTING_EXTRACT_TO_SUBFOLDER = "extract_to_subfolder"
 SETTING_DELETE_ARCHIVE_AFTER_EXTRACT = "delete_archive_after_extract"
 SETTING_POSTPROCESS_ESDE_M3U = "postprocess_esde_m3u"
+SETTING_POSTPROCESS_ESDE_SINGLE_FILE = "postprocess_esde_single_file"
 SETTING_CHD_CONVERT = "chd_convert"
 SETTING_CHD_TYPE = "chd_type"
 SETTING_CHD_DELETE_SOURCE = "chd_delete_source"
@@ -101,6 +107,7 @@ DEFAULT_EXTRACT_ARCHIVES = True
 DEFAULT_EXTRACT_TO_SUBFOLDER = True
 DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT = False
 DEFAULT_POSTPROCESS_ESDE_M3U = False
+DEFAULT_POSTPROCESS_ESDE_SINGLE_FILE = True
 DEFAULT_CHD_CONVERT = False
 DEFAULT_CHD_TYPE = "cd"
 DEFAULT_CHD_DELETE_SOURCE = False
@@ -678,6 +685,7 @@ class Config:
         self.extract_to_subfolder: bool = DEFAULT_EXTRACT_TO_SUBFOLDER
         self.delete_archive_after_extract: bool = DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT
         self.postprocess_esde_m3u: bool = DEFAULT_POSTPROCESS_ESDE_M3U
+        self.postprocess_esde_single_file: bool = DEFAULT_POSTPROCESS_ESDE_SINGLE_FILE
         self.chd_convert: bool = DEFAULT_CHD_CONVERT
         self.chd_type: str = DEFAULT_CHD_TYPE
         self.chd_delete_source: bool = DEFAULT_CHD_DELETE_SOURCE
@@ -700,6 +708,7 @@ class Config:
             "extract_to_subfolder": self.extract_to_subfolder,
             "delete_archive_after_extract": self.delete_archive_after_extract,
             "postprocess_esde_m3u": self.postprocess_esde_m3u,
+            "postprocess_esde_single_file": self.postprocess_esde_single_file,
             "chd_convert": self.chd_convert,
             "chd_type": self.chd_type,
             "chd_delete_source": self.chd_delete_source,
@@ -2587,11 +2596,19 @@ class DownloadWorker(QtCore.QThread):
         except OSError as e:
             return False, f"Failed to run 7z for {archive_path.name}: {e}", 0
 
-    def _run_esde_postprocess(self, roots: List[Path]) -> Tuple[int, int, int]:
+    def _run_esde_postprocess(
+        self,
+        roots: List[Path],
+        postprocess_single_file: bool = False,
+    ) -> Tuple[int, int, int, int]:
         """Run ES-DE directory-as-file conversion for extracted roots."""
         if esde_build_plans is None or esde_execute_plan is None:
             self.log_signal.emit("⚠️  ES-DE post-process requested, but esde_rom_formatter_core.py is not available.")
-            return 0, 0, 0
+            return 0, 0, 0, 0
+        if postprocess_single_file and esde_postprocess_single_disc_folders is None:
+            self.log_signal.emit(
+                "⚠️  ES-DE single-file post-process requested, but helper is not available in esde_rom_formatter_core.py."
+            )
 
         class _GuiLogger:
             def __init__(self, emit: QtCore.pyqtSignal) -> None:
@@ -2615,17 +2632,28 @@ class DownloadWorker(QtCore.QThread):
         groups_total = 0
         moved_total = 0
         skipped_total = 0
+        single_file_renamed_total = 0
         for root in unique_roots:
             self.log_signal.emit(f"🧩 ES-DE post-process scan: {normalize_path_display(str(root))}")
             plans = esde_build_plans(root, recursive=True, logger=logger)
-            if not plans:
-                continue
-            groups_total += len(plans)
-            for plan in plans:
-                moved, skipped = esde_execute_plan(plan, dry_run=False, logger=logger)
-                moved_total += moved
-                skipped_total += skipped
-        return groups_total, moved_total, skipped_total
+            if plans:
+                groups_total += len(plans)
+                for plan in plans:
+                    moved, skipped = esde_execute_plan(plan, dry_run=False, logger=logger)
+                    moved_total += moved
+                    skipped_total += skipped
+
+            if postprocess_single_file and esde_postprocess_single_disc_folders is not None:
+                try:
+                    single_file_renamed_total += esde_postprocess_single_disc_folders(
+                        root,
+                        recursive=True,
+                        dry_run=False,
+                        logger=logger,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    self.log_signal.emit(f"WARN: Single-file post-process failed in {root.name}: {e}")
+        return groups_total, moved_total, skipped_total, single_file_renamed_total
 
     def _run_chd_conversion(
         self,
@@ -3041,6 +3069,9 @@ class DownloadWorker(QtCore.QThread):
             self._config.get("delete_archive_after_extract", DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT)
         )
         postprocess_esde_m3u = bool(self._config.get("postprocess_esde_m3u", DEFAULT_POSTPROCESS_ESDE_M3U))
+        postprocess_esde_single_file = bool(
+            self._config.get("postprocess_esde_single_file", DEFAULT_POSTPROCESS_ESDE_SINGLE_FILE)
+        )
         chd_convert = bool(self._config.get("chd_convert", DEFAULT_CHD_CONVERT))
         chd_type = str(self._config.get("chd_type", DEFAULT_CHD_TYPE) or DEFAULT_CHD_TYPE).strip().lower()
         chd_delete_source = bool(self._config.get("chd_delete_source", DEFAULT_CHD_DELETE_SOURCE))
@@ -3066,6 +3097,8 @@ class DownloadWorker(QtCore.QThread):
                     self.log_signal.emit("🗑️  CHD cleanup enabled: delete source file after successful conversion")
             if postprocess_esde_m3u:
                 self.log_signal.emit("🧩 ES-DE post-process enabled for extracted folders")
+                if postprocess_esde_single_file:
+                    self.log_signal.emit("🧩 ES-DE single-file rename enabled (Game -> Game.ext)")
         download_dir.mkdir(parents=True, exist_ok=True)
 
         successful = 0
@@ -3076,6 +3109,7 @@ class DownloadWorker(QtCore.QThread):
         chd_failed = 0
         chd_skipped = 0
         chd_source_deleted = 0
+        esde_single_file_renamed = 0
         extract_futures: Dict[object, Path] = {}
         postprocess_roots: set[Path] = set()
 
@@ -3517,13 +3551,18 @@ class DownloadWorker(QtCore.QThread):
                 self.log_signal.emit(f"🗑️  CHD sources deleted: {chd_source_deleted:,}")
 
         if extract_enabled and postprocess_esde_m3u and postprocess_roots:
-            groups, moved, skipped = self._run_esde_postprocess(list(postprocess_roots))
+            groups, moved, skipped, esde_single_file_renamed = self._run_esde_postprocess(
+                list(postprocess_roots),
+                postprocess_single_file=postprocess_esde_single_file,
+            )
             if groups > 0:
                 self.log_signal.emit(
                     f"🧩 ES-DE post-process complete: groups {groups:,}, files moved {moved:,}, skipped {skipped:,}"
                 )
             else:
                 self.log_signal.emit("🧩 ES-DE post-process complete: no multi-disc groups found.")
+            if postprocess_esde_single_file:
+                self.log_signal.emit(f"🧩 ES-DE single-file folders renamed: {esde_single_file_renamed:,}")
 
         if self._stop_requested or self.isInterruptionRequested():
             self.log_signal.emit("🛑 Stop requested - skipping remaining downloads.")
@@ -3556,6 +3595,8 @@ class DownloadWorker(QtCore.QThread):
                 self.log_signal.emit(f"   ⏭️  CHD skipped (already exists): {chd_skipped:,}")
                 if chd_delete_source:
                     self.log_signal.emit(f"   🗑️  CHD sources deleted: {chd_source_deleted:,}")
+            if postprocess_esde_m3u and postprocess_esde_single_file:
+                self.log_signal.emit(f"   🧩 ES-DE single-file folders renamed: {esde_single_file_renamed:,}")
         self.log_signal.emit(f"   ⏱️  Time elapsed: {format_time(total_elapsed)}")
         self.log_signal.emit(f"   🚀 Average speed: {format_speed(avg_rate)}")
         self.log_signal.emit("=" * 70)
@@ -3897,6 +3938,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.esde_post_title_label = esde_post_title
         self.esde_post_subtitle_label = esde_post_subtitle
 
+        esde_single_file_row, self.postprocess_esde_single_file_check, esde_single_file_subtitle, esde_single_file_title = add_option_row(
+            "Post-Process Single-File Folders (Game -> Game.ext)",
+            "Optional: rename single-file folders for ES-DE directory-as-file launching (for example Game -> Game.chd).",
+            DEFAULT_POSTPROCESS_ESDE_SINGLE_FILE,
+        )
+        self.esde_single_file_title_label = esde_single_file_title
+        self.esde_single_file_subtitle_label = esde_single_file_subtitle
+
         chd_row, self.chd_convert_check, chd_subtitle, chd_title = add_option_row(
             "Convert Extracted Disc Files to CHD (requires chdman in PATH)",
             "Uses chdman createcd/createdvd on extracted files.",
@@ -3968,10 +4017,11 @@ class MainWindow(QtWidgets.QMainWindow):
         options_layout.addWidget(extract_row)
         options_layout.addWidget(extract_mode_row)
         options_layout.addWidget(delete_archive_row)
+        options_layout.addWidget(esde_post_row)
+        options_layout.addWidget(esde_single_file_row)
         options_layout.addWidget(chd_row)
         options_layout.addWidget(chd_type_row)
         options_layout.addWidget(chd_delete_row)
-        options_layout.addWidget(esde_post_row)
 
         self.download_threads_spin = threads_spin
 
@@ -4193,6 +4243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_igir_check.stateChanged.connect(self._on_use_igir_changed)
         self.extract_archives_check.stateChanged.connect(self._on_extract_archives_changed)
         self.chd_convert_check.stateChanged.connect(self._on_chd_convert_changed)
+        self.postprocess_esde_m3u_check.stateChanged.connect(self._on_esde_postprocess_changed)
 
         # Load saved settings BEFORE validation so we validate the loaded values
         self._load_settings()
@@ -4207,6 +4258,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_use_igir_changed(self.use_igir_check.checkState())
         self._on_extract_archives_changed(self.extract_archives_check.checkState())
         self._on_chd_convert_changed(self.chd_convert_check.checkState())
+        self._on_esde_postprocess_changed(self.postprocess_esde_m3u_check.checkState())
 
         if USE_FRAMELESS_WINDOWS:
             # Window recovery helpers for frameless mode.
@@ -4426,10 +4478,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.postprocess_esde_m3u_check.setEnabled(is_checked)
         self.esde_post_title_label.setEnabled(is_checked)
         self.esde_post_subtitle_label.setEnabled(is_checked)
+        self._on_esde_postprocess_changed(self.postprocess_esde_m3u_check.checkState())
         self.chd_convert_check.setEnabled(is_checked)
         self.chd_title_label.setEnabled(is_checked)
         self.chd_subtitle_label.setEnabled(is_checked)
         self._on_chd_convert_changed(self.chd_convert_check.checkState())
+
+    def _on_esde_postprocess_changed(self, state: int) -> None:
+        can_enable = self.extract_archives_check.isChecked() and state == QtCore.Qt.Checked
+        self.postprocess_esde_single_file_check.setEnabled(can_enable)
+        self.esde_single_file_title_label.setEnabled(can_enable)
+        self.esde_single_file_subtitle_label.setEnabled(can_enable)
 
     def _on_chd_convert_changed(self, state: int) -> None:
         can_enable = self.extract_archives_check.isChecked() and state == QtCore.Qt.Checked
@@ -4490,6 +4549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         config_snapshot["chd_type"] = str(self.chd_type_combo.currentData() or DEFAULT_CHD_TYPE)
         config_snapshot["chd_delete_source"] = self.chd_delete_source_check.isChecked()
         config_snapshot["postprocess_esde_m3u"] = self.postprocess_esde_m3u_check.isChecked()
+        config_snapshot["postprocess_esde_single_file"] = self.postprocess_esde_single_file_check.isChecked()
 
         # RetroAchievements DATs always use simple fixdat matching; skip IGIR
         if getattr(self, "_retroachievements_dat", False):
@@ -4908,6 +4968,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.postprocess_esde_m3u_check.setChecked(
             settings.value(SETTING_POSTPROCESS_ESDE_M3U, DEFAULT_POSTPROCESS_ESDE_M3U, bool)
         )
+        self.postprocess_esde_single_file_check.setChecked(
+            settings.value(SETTING_POSTPROCESS_ESDE_SINGLE_FILE, DEFAULT_POSTPROCESS_ESDE_SINGLE_FILE, bool)
+        )
 
         self.download_threads_spin.setValue(
             settings.value(
@@ -4950,6 +5013,10 @@ class MainWindow(QtWidgets.QMainWindow):
             SETTING_POSTPROCESS_ESDE_M3U,
             self.postprocess_esde_m3u_check.isChecked(),
         )
+        settings.setValue(
+            SETTING_POSTPROCESS_ESDE_SINGLE_FILE,
+            self.postprocess_esde_single_file_check.isChecked(),
+        )
 
         settings.setValue(
             SETTING_DOWNLOAD_THREADS,
@@ -4974,6 +5041,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chd_type_combo.currentIndexChanged.connect(self._on_settings_changed)
         self.chd_delete_source_check.stateChanged.connect(self._on_settings_changed)
         self.postprocess_esde_m3u_check.stateChanged.connect(self._on_settings_changed)
+        self.postprocess_esde_single_file_check.stateChanged.connect(self._on_settings_changed)
         self.download_threads_spin.valueChanged.connect(self._on_settings_changed)
 
 
