@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Myrient Can FixDAT
+Can FixDAT
 
 Identify and download missing ROMs from Myrient using IGIR reports or a fixdat.
 Includes a Qt (PyQt5) GUI.
@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Tuple
@@ -37,6 +37,13 @@ import requests
 # Qt imports
 from PyQt5 import QtCore, QtGui, QtWidgets  # type: ignore
 from PyQt5.QtCore import QSettings
+
+# Optional integration with ESDE ROM Formatter post-processing tool.
+try:
+    from esde_rom_formatter_core import build_plans as esde_build_plans, execute_plan as esde_execute_plan
+except ImportError:
+    esde_build_plans = None  # type: ignore[assignment]
+    esde_execute_plan = None  # type: ignore[assignment]
 
 # Optional HTML parser (recommended). If missing, we fall back to a simpler regex parser.
 try:
@@ -58,6 +65,10 @@ SETTING_USE_IGIR = "use_igir"
 SETTING_CLEAN_ROMS = "clean_roms"
 SETTING_SELECT_DOWNLOADS = "select_downloads"
 SETTING_DOWNLOAD_THREADS = "download_threads"
+SETTING_EXTRACT_ARCHIVES = "extract_archives"
+SETTING_EXTRACT_TO_SUBFOLDER = "extract_to_subfolder"
+SETTING_DELETE_ARCHIVE_AFTER_EXTRACT = "delete_archive_after_extract"
+SETTING_POSTPROCESS_ESDE_M3U = "postprocess_esde_m3u"
 
 
 # File and path constants
@@ -82,6 +93,11 @@ CHUNK_SIZE = 1024 * 256  # 256KB
 MAX_SIZE_DIFFERENCE = 1_048_576  # 1MB
 HTTP_USER_AGENT = "MyrientCanFixDAT/1.0"
 DEFAULT_MAX_DOWNLOAD_WORKERS = 4
+DEFAULT_EXTRACT_ARCHIVES = True
+DEFAULT_EXTRACT_TO_SUBFOLDER = True
+DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT = False
+DEFAULT_POSTPROCESS_ESDE_M3U = False
+ARCHIVE_EXTENSIONS = (".zip", ".7z")
 
 # UI constants
 WINDOW_DEFAULT_WIDTH = 1200
@@ -627,6 +643,10 @@ class Config:
         self.auto_config_yes: bool = True
         self.clean_roms: bool = True
         self.include_clones: bool = True  # When False (1G1R), exclude cloneof entries
+        self.extract_archives: bool = DEFAULT_EXTRACT_ARCHIVES
+        self.extract_to_subfolder: bool = DEFAULT_EXTRACT_TO_SUBFOLDER
+        self.delete_archive_after_extract: bool = DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT
+        self.postprocess_esde_m3u: bool = DEFAULT_POSTPROCESS_ESDE_M3U
 
 
     def to_dict(self) -> Dict[str, object]:
@@ -642,6 +662,10 @@ class Config:
             "auto_config_yes": self.auto_config_yes,
             "clean_roms": self.clean_roms,
             "include_clones": self.include_clones,
+            "extract_archives": self.extract_archives,
+            "extract_to_subfolder": self.extract_to_subfolder,
+            "delete_archive_after_extract": self.delete_archive_after_extract,
+            "postprocess_esde_m3u": self.postprocess_esde_m3u,
         }
 
     def update_from_dict(self, data: Dict[str, object]) -> None:
@@ -2046,7 +2070,7 @@ class TitleBar(QtWidgets.QWidget):
         icon_label = QtWidgets.QLabel("🎮")
         icon_label.setObjectName("titleIcon")
 
-        title_label = QtWidgets.QLabel("Myrient Can FixDAT")
+        title_label = QtWidgets.QLabel("Can FixDAT")
         title_label.setObjectName("titleText")
 
         layout.addWidget(icon_label)
@@ -2310,6 +2334,223 @@ class DownloadWorker(QtCore.QThread):
             return deleted
         return deleted
 
+    def _find_7z_executable(self) -> Optional[str]:
+        """Return a 7z-compatible executable path if available."""
+        for candidate in ("7z", "7zz", "7za", "7zr"):
+            exe = shutil.which(candidate)
+            if exe:
+                return exe
+        return None
+
+    def _flatten_single_new_nested_dir(self, output_dir: Path, pre_names: set[str]) -> Tuple[bool, str, int]:
+        """Flatten one newly-created top-level directory into output_dir when safe."""
+        try:
+            post_paths = {p.name: p for p in output_dir.iterdir()}
+        except OSError as e:
+            return False, f"Unable to inspect extracted files in {output_dir.name}: {e}", 0
+
+        new_entries = [post_paths[name] for name in post_paths if name not in pre_names]
+        new_dirs = [p for p in new_entries if p.is_dir()]
+        new_files = [p for p in new_entries if p.is_file()]
+
+        if len(new_dirs) != 1 or len(new_files) != 0:
+            return True, "", 0
+
+        nested = new_dirs[0]
+        try:
+            nested_children = list(nested.iterdir())
+        except OSError as e:
+            return False, f"Unable to inspect nested folder {nested.name}: {e}", 0
+
+        for child in nested_children:
+            target = output_dir / child.name
+            if target.exists():
+                return False, f"Could not flatten {nested.name}: '{child.name}' already exists", 0
+
+        moved = 0
+        for child in nested_children:
+            shutil.move(str(child), str(output_dir / child.name))
+            moved += 1
+        nested.rmdir()
+        return True, f"Flattened nested folder '{nested.name}'", moved
+
+    def _extract_archive(
+        self,
+        archive_path: Path,
+        extract_to_subfolder: bool,
+        delete_archive_after_extract: bool,
+    ) -> Tuple[bool, str, int]:
+        """Extract .zip/.7z archive into a sibling folder named after the archive stem."""
+        suffix = archive_path.suffix.lower()
+        if suffix not in ARCHIVE_EXTENSIONS:
+            return False, f"Unsupported archive format: {archive_path.name}", 0
+        if not archive_path.exists():
+            return False, f"Archive not found: {archive_path.name}", 0
+
+        output_dir = archive_path.parent / archive_path.stem if extract_to_subfolder else archive_path.parent
+        target_label = output_dir.name if extract_to_subfolder else "."
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return False, f"Failed to create extract directory for {archive_path.name}: {e}", 0
+        try:
+            pre_names = {p.name for p in output_dir.iterdir()}
+        except OSError:
+            pre_names = set()
+
+        if suffix == ".zip":
+            try:
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    members = [i for i in zf.infolist() if not i.is_dir()]
+                    zf.extractall(output_dir)
+                flat_ok, flat_msg, _flat_moved = self._flatten_single_new_nested_dir(output_dir, pre_names)
+                if not flat_ok:
+                    return False, flat_msg, len(members)
+                msg = f"Extracted {archive_path.name} -> {target_label}"
+                if flat_msg:
+                    msg = f"{msg} ({flat_msg})"
+                if delete_archive_after_extract:
+                    try:
+                        archive_path.unlink()
+                        msg = f"{msg} [deleted archive]"
+                    except OSError as e:
+                        return False, f"{msg} [failed deleting archive: {e}]", len(members)
+                return True, msg, len(members)
+            except (zipfile.BadZipFile, OSError) as e:
+                return False, f"Failed to extract {archive_path.name}: {e}", 0
+
+        exe = self._find_7z_executable()
+        if not exe:
+            return False, f"No 7z executable found for {archive_path.name}", 0
+
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [exe, "x", "-y", f"-o{output_dir}", str(archive_path)],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                check=False,
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                if not stderr:
+                    stderr = (proc.stdout or "").strip()
+                return False, f"Failed to extract {archive_path.name}: {stderr or '7z error'}", 0
+            flat_ok, flat_msg, _flat_moved = self._flatten_single_new_nested_dir(output_dir, pre_names)
+            if not flat_ok:
+                return False, flat_msg, 0
+            msg = f"Extracted {archive_path.name} -> {target_label}"
+            if flat_msg:
+                msg = f"{msg} ({flat_msg})"
+            if delete_archive_after_extract:
+                try:
+                    archive_path.unlink()
+                    msg = f"{msg} [deleted archive]"
+                except OSError as e:
+                    return False, f"{msg} [failed deleting archive: {e}]", 0
+            return True, msg, 0
+        except subprocess.TimeoutExpired:
+            return False, f"Timed out extracting {archive_path.name}", 0
+        except OSError as e:
+            return False, f"Failed to run 7z for {archive_path.name}: {e}", 0
+
+    def _run_esde_postprocess(self, roots: List[Path]) -> Tuple[int, int, int]:
+        """Run ES-DE directory-as-file conversion for extracted roots."""
+        if esde_build_plans is None or esde_execute_plan is None:
+            self.log_signal.emit("⚠️  ES-DE post-process requested, but esde_rom_formatter_core.py is not available.")
+            return 0, 0, 0
+
+        class _GuiLogger:
+            def __init__(self, emit: QtCore.pyqtSignal) -> None:
+                self._emit = emit
+                self.verbose = False
+
+            def info(self, message: str) -> None:
+                self._emit.emit(message)
+
+            def warn(self, message: str) -> None:
+                self._emit.emit(f"WARN: {message}")
+
+            def debug(self, message: str) -> None:
+                return
+
+        def maybe_suffix_single_disc_folder(folder: Path) -> Path:
+            """For extracted single-disc folders, suffix folder with launcher extension (prefer .cue)."""
+            if not folder.exists() or not folder.is_dir() or folder.suffix:
+                return folder
+            try:
+                entries = list(folder.iterdir())
+            except OSError:
+                return folder
+
+            top_files = [p for p in entries if p.is_file()]
+            if not top_files:
+                return folder
+
+            launch_exts = {
+                ".cue", ".chd", ".iso", ".rvz", ".gdi", ".ccd", ".mds",
+                ".pbp", ".cso", ".wbfs", ".wia", ".img", ".mdf",
+            }
+            launchers = [p for p in top_files if p.suffix.lower() in launch_exts]
+            cues = [p for p in launchers if p.suffix.lower() == ".cue"]
+
+            target_name = ""
+            if len(cues) == 1:
+                target_name = cues[0].name
+            elif len(launchers) == 1:
+                target_name = launchers[0].name
+            else:
+                return folder
+
+            target = folder.with_name(target_name)
+            if target.exists():
+                self.log_signal.emit(
+                    f"⚠️  ES-DE post-process: cannot rename '{folder.name}' to '{target.name}' (already exists)"
+                )
+                return folder
+            try:
+                folder.rename(target)
+                self.log_signal.emit(f"🧩 ES-DE post-process: renamed '{folder.name}' -> '{target.name}'")
+                return target
+            except OSError as e:
+                self.log_signal.emit(f"⚠️  ES-DE post-process: rename failed for '{folder.name}': {e}")
+                return folder
+
+        logger = _GuiLogger(self.log_signal)
+        unique_roots = sorted({p.resolve() for p in roots if p.exists() and p.is_dir()}, key=lambda p: str(p).lower())
+        if not unique_roots:
+            return 0, 0, 0
+
+        groups_total = 0
+        moved_total = 0
+        skipped_total = 0
+        for root in unique_roots:
+            root = maybe_suffix_single_disc_folder(root)
+            if not root.exists() or not root.is_dir():
+                continue
+
+            # Also normalize single-disc subfolders so this works even when extraction target is a parent directory.
+            try:
+                subdirs = [p for p in root.rglob("*") if p.is_dir()]
+            except OSError:
+                subdirs = []
+            # Deepest-first avoids path invalidation when renaming nested folders.
+            for subdir in sorted(subdirs, key=lambda p: len(p.parts), reverse=True):
+                if subdir.name.lower().endswith(".m3u"):
+                    continue
+                maybe_suffix_single_disc_folder(subdir)
+
+            self.log_signal.emit(f"🧩 ES-DE post-process scan: {normalize_path_display(str(root))}")
+            plans = esde_build_plans(root, recursive=True, logger=logger)
+            if not plans:
+                continue
+            groups_total += len(plans)
+            for plan in plans:
+                moved, skipped = esde_execute_plan(plan, dry_run=False, logger=logger)
+                moved_total += moved
+                skipped_total += skipped
+        return groups_total, moved_total, skipped_total
+
     def _emit_log_lines(self, text: str) -> None:
         if not text:
             return
@@ -2320,7 +2561,7 @@ class DownloadWorker(QtCore.QThread):
     def _log_header(self) -> None:
         """Log the application header."""
         self.log_signal.emit("=" * 70)
-        self.log_signal.emit("🎮 Myrient Can FixDAT 🎮")
+        self.log_signal.emit("🎮 Can FixDAT 🎮")
         self.log_signal.emit("=" * 70)
 
     def _setup_fixdat_config(self) -> Tuple[bool, Optional[Path]]:
@@ -2586,11 +2827,33 @@ class DownloadWorker(QtCore.QThread):
         # Folder sizes were set by enrich_matched_games_with_folder_sizes in _match_games_with_myrient
         total_size = sum(int(g.get("File Size", 0) or 0) for g in matched_games)
 
+        extract_enabled = bool(self._config.get("extract_archives", DEFAULT_EXTRACT_ARCHIVES))
+        extract_to_subfolder = bool(self._config.get("extract_to_subfolder", DEFAULT_EXTRACT_TO_SUBFOLDER))
+        delete_archive_after_extract = bool(
+            self._config.get("delete_archive_after_extract", DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT)
+        )
+        postprocess_esde_m3u = bool(self._config.get("postprocess_esde_m3u", DEFAULT_POSTPROCESS_ESDE_M3U))
+        extract_workers = max(1, min(4, max_workers))
+
         self.log_signal.emit(f"📥 Downloading {total_games:,} games ({format_size(total_size)})")
+        if extract_enabled:
+            mode_text = "archive subfolder" if extract_to_subfolder else "current folder"
+            self.log_signal.emit(
+                f"📦 Auto-extract enabled for {', '.join(ARCHIVE_EXTENSIONS)} to {mode_text} "
+                f"(up to {extract_workers} workers)"
+            )
+            if delete_archive_after_extract:
+                self.log_signal.emit("🗑️  Archive cleanup enabled: delete archive after successful extraction")
+            if postprocess_esde_m3u:
+                self.log_signal.emit("🧩 ES-DE post-process enabled for extracted folders")
         download_dir.mkdir(parents=True, exist_ok=True)
 
         successful = 0
         failed = 0
+        extracted_ok = 0
+        extracted_failed = 0
+        extract_futures: Dict[object, Path] = {}
+        postprocess_roots: set[Path] = set()
 
         # Aggregate progress by file key for correct overall progress with concurrency
         bytes_by_key: Dict[str, int] = {}
@@ -2600,6 +2863,47 @@ class DownloadWorker(QtCore.QThread):
 
         def make_key(output_path: Path, game_name: str) -> str:
             return f"{output_path.name}::{game_name}"
+
+        def archive_output_already_present(archive_path: Path) -> bool:
+            """Return True if an archive appears to have been extracted already."""
+            if not extract_enabled:
+                return False
+            if archive_path.suffix.lower() not in ARCHIVE_EXTENSIONS:
+                return False
+
+            parent = archive_path.parent
+            stem = archive_path.stem
+
+            # Default extraction target before optional ES-DE rename.
+            direct_target = parent / stem
+            try:
+                if direct_target.exists() and direct_target.is_dir() and any(direct_target.iterdir()):
+                    return True
+            except OSError:
+                pass
+
+            # ES-DE post-process may rename folder to launcher extension, e.g. "Game.cue".
+            try:
+                for candidate in parent.glob(f"{stem}.*"):
+                    if candidate == archive_path:
+                        continue
+                    if candidate.is_dir():
+                        return True
+            except OSError:
+                pass
+
+            # Flat extraction mode can leave files directly in parent.
+            if not extract_to_subfolder:
+                try:
+                    for candidate in parent.glob(f"{stem}.*"):
+                        if candidate == archive_path:
+                            continue
+                        if candidate.exists():
+                            return True
+                except OSError:
+                    pass
+
+            return False
 
         def emit_progress_locked(now: float, current_key: str = "") -> None:
             """
@@ -2642,7 +2946,7 @@ class DownloadWorker(QtCore.QThread):
                 eta_text,
             )
 
-        def download_one(game: Dict[str, object], index: int, slot_id: int) -> Tuple[bool, bool, str, int, float]:
+        def download_one(game: Dict[str, object], index: int, slot_id: int) -> Tuple[bool, bool, str, int, float, List[Path]]:
             """
             Worker task (runs in ThreadPoolExecutor thread).
 
@@ -2667,6 +2971,7 @@ class DownloadWorker(QtCore.QThread):
                     num_files = len(contents)
                     folder_ok = True
                     folder_downloaded = 0
+                    folder_archives: List[Path] = []
                     for j, item in enumerate(contents):
                         if self._stop_requested or self.isInterruptionRequested():
                             self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
@@ -2730,25 +3035,27 @@ class DownloadWorker(QtCore.QThread):
                             folder_downloaded += n
                             with self._lock:
                                 bytes_by_key[key] = n
+                            if out_path.suffix.lower() in ARCHIVE_EXTENSIONS:
+                                folder_archives.append(out_path)
                         else:
                             folder_ok = False
                     if self._stop_requested or self.isInterruptionRequested():
                         self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
                         self.thread_progress_signal.emit(slot_id, None, "--", "")
-                        return False, False, game_name, folder_downloaded, 0.0
+                        return False, False, game_name, folder_downloaded, 0.0, []
                     if folder_ok:
                         successful += 1
                         self.log_signal.emit(f"✅ [{index}/{total_games}] {game_name} (folder) - {num_files} file(s)")
                         self.progress_signal.emit(None, 0.0, "", "", "", "")
                         self.thread_progress_signal.emit(slot_id, 100, f"{format_size(folder_downloaded)}", "")
-                        return True, False, game_name, folder_downloaded, 0.0
+                        return True, False, game_name, folder_downloaded, 0.0, folder_archives
                     failed += 1
                     self.log_signal.emit(f"❌ [{index}/{total_games}] {game_name} - Some files failed")
                 except Exception:  # noqa: BLE001
                     failed += 1
                 self.progress_signal.emit(None, 0.0, "", "", "", "")
                 self.thread_progress_signal.emit(slot_id, None, "--", "")
-                return False, False, game_name, folder_downloaded, 0.0
+                return False, False, game_name, folder_downloaded, 0.0, []
 
             filename = myrient_filename or (urllib.parse.unquote(url.split("/")[-1]).rstrip("/") if url else "") or f"download_{index}"
             output_path = download_dir / filename
@@ -2766,7 +3073,14 @@ class DownloadWorker(QtCore.QThread):
                 with self._lock:
                     bytes_by_key[key] = file_size
                 self.thread_progress_signal.emit(slot_id, 100, "Skipped", "")
-                return True, True, game_name, file_size, 0.0
+                return True, True, game_name, file_size, 0.0, []
+            if archive_output_already_present(output_path):
+                self.log_signal.emit(f"⏭️  [{index}/{total_games}] {game_name} - Archive already extracted, skipping")
+                successful += 1
+                with self._lock:
+                    bytes_by_key[key] = file_size
+                self.thread_progress_signal.emit(slot_id, 100, "Extracted", "")
+                return True, True, game_name, file_size, 0.0, []
 
             # Per-file progress callback (called from this worker thread)
             def progress_cb(downloaded: int, total: int, rate: float, elapsed: float) -> None:
@@ -2822,7 +3136,7 @@ class DownloadWorker(QtCore.QThread):
                         pass
                     self.log_signal.emit(f"\n{ERROR_STOP_REQUESTED}")
                     self.thread_progress_signal.emit(slot_id, None, "--", "")
-                    return False, False, game_name, downloaded_bytes, elapsed
+                    return False, False, game_name, downloaded_bytes, elapsed, []
 
                 self.progress_signal.emit(None, 0.0, "", "", "", "")
             except Exception:  # noqa: BLE001
@@ -2837,7 +3151,8 @@ class DownloadWorker(QtCore.QThread):
                 self._active_file_key = key
             if not success:
                 self.thread_progress_signal.emit(slot_id, None, "--", "")
-            return success, False, game_name, downloaded_bytes, elapsed
+            archives = [output_path] if success and output_path.suffix.lower() in ARCHIVE_EXTENSIONS else []
+            return success, False, game_name, downloaded_bytes, elapsed, archives
 
         # Initial UI state
         self.status_signal.emit("Downloading...")
@@ -2850,6 +3165,7 @@ class DownloadWorker(QtCore.QThread):
         active = set()
         free_slots = list(range(max_workers))
         future_to_slot: Dict[object, int] = {}
+        extract_executor = ThreadPoolExecutor(max_workers=extract_workers) if extract_enabled else None
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             # Initial fill
@@ -2881,7 +3197,7 @@ class DownloadWorker(QtCore.QThread):
                         if slot_id is not None:
                             free_slots.append(slot_id)
                             self.thread_progress_signal.emit(slot_id, None, "--", "")
-                        ok, skipped, game_name, downloaded_bytes, elapsed = fut.result()
+                        ok, skipped, game_name, downloaded_bytes, elapsed, archive_paths = fut.result()
                         if ok:
                             successful += 1
                             if skipped:
@@ -2890,6 +3206,16 @@ class DownloadWorker(QtCore.QThread):
                                 self.log_signal.emit(
                                     f"✅ {game_name} - {format_size(downloaded_bytes)} in {elapsed:.1f}s"
                                 )
+                                if extract_executor and archive_paths:
+                                    for archive_path in archive_paths:
+                                        target_dir = archive_path.parent / archive_path.stem if extract_to_subfolder else archive_path.parent
+                                        ef = extract_executor.submit(
+                                            self._extract_archive,
+                                            archive_path,
+                                            extract_to_subfolder,
+                                            delete_archive_after_extract,
+                                        )
+                                        extract_futures[ef] = target_dir
                         else:
                             failed += 1
                             self.log_signal.emit(f"❌ {game_name} - Failed")
@@ -2915,6 +3241,35 @@ class DownloadWorker(QtCore.QThread):
                     active.add(future)
                     future_to_slot[future] = slot_id
 
+        if extract_futures:
+            self.log_signal.emit(f"🗜️  Waiting for {len(extract_futures)} extraction task(s)...")
+            for ef in as_completed(list(extract_futures.keys())):
+                target_dir = extract_futures.get(ef)
+                try:
+                    ok, message, _count = ef.result()
+                    if ok:
+                        extracted_ok += 1
+                        self.log_signal.emit(f"✅ {message}")
+                        if target_dir is not None:
+                            postprocess_roots.add(target_dir)
+                    else:
+                        extracted_failed += 1
+                        self.log_signal.emit(f"⚠️  {message}")
+                except Exception as e:  # noqa: BLE001
+                    extracted_failed += 1
+                    self.log_signal.emit(f"⚠️  Extraction task failed: {e}")
+        if extract_executor:
+            extract_executor.shutdown(wait=False, cancel_futures=False)
+
+        if extract_enabled and postprocess_esde_m3u and postprocess_roots:
+            groups, moved, skipped = self._run_esde_postprocess(list(postprocess_roots))
+            if groups > 0:
+                self.log_signal.emit(
+                    f"🧩 ES-DE post-process complete: groups {groups:,}, files moved {moved:,}, skipped {skipped:,}"
+                )
+            else:
+                self.log_signal.emit("🧩 ES-DE post-process complete: no multi-disc groups found.")
+
         if self._stop_requested or self.isInterruptionRequested():
             self.log_signal.emit("🛑 Stop requested - skipping remaining downloads.")
             self.status_signal.emit("Stopped")
@@ -2937,6 +3292,9 @@ class DownloadWorker(QtCore.QThread):
         self.log_signal.emit(f"   ✅ Successful: {successful:,}/{total_games:,}")
         self.log_signal.emit(f"   ❌ Failed: {failed:,}/{total_games:,}")
         self.log_signal.emit(f"   📦 Total downloaded: {format_size(total_downloaded)}/{format_size(total_size)}")
+        if extract_enabled:
+            self.log_signal.emit(f"   📂 Extracted: {extracted_ok:,}")
+            self.log_signal.emit(f"   ⚠️  Extraction issues: {extracted_failed:,}")
         self.log_signal.emit(f"   ⏱️  Time elapsed: {format_time(total_elapsed)}")
         self.log_signal.emit(f"   🚀 Average speed: {format_speed(avg_rate)}")
         self.log_signal.emit("=" * 70)
@@ -3005,7 +3363,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Myrient Can FixDAT")
+        self.setWindowTitle("Can FixDAT")
         self.resize(WINDOW_DEFAULT_WIDTH, WINDOW_HEIGHT)
         self.setMinimumWidth(WINDOW_MIN_WIDTH)
 
@@ -3242,6 +3600,42 @@ class MainWindow(QtWidgets.QMainWindow):
             False,
         )
         options_layout.addWidget(select_row)
+
+        extract_row, self.extract_archives_check, extract_subtitle, extract_title = add_option_row(
+            "Extract Downloaded Archives (.zip/.7z)",
+            "Automatically extracts archives after download using internal worker threads.",
+            DEFAULT_EXTRACT_ARCHIVES,
+        )
+        self.extract_archives_title_label = extract_title
+        self.extract_archives_subtitle_label = extract_subtitle
+        options_layout.addWidget(extract_row)
+
+        extract_mode_row, self.extract_to_subfolder_check, extract_mode_subtitle, extract_mode_title = add_option_row(
+            "Extract Into Archive-Named Subfolder",
+            "If disabled, extracts into current folder and auto-flattens single nested archive folders.",
+            DEFAULT_EXTRACT_TO_SUBFOLDER,
+        )
+        self.extract_mode_title_label = extract_mode_title
+        self.extract_mode_subtitle_label = extract_mode_subtitle
+        options_layout.addWidget(extract_mode_row)
+
+        delete_archive_row, self.delete_archive_after_extract_check, delete_archive_subtitle, delete_archive_title = add_option_row(
+            "Delete Archive After Successful Extraction",
+            "Removes .zip/.7z file only if extraction completed successfully.",
+            DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT,
+        )
+        self.delete_archive_title_label = delete_archive_title
+        self.delete_archive_subtitle_label = delete_archive_subtitle
+        options_layout.addWidget(delete_archive_row)
+
+        esde_post_row, self.postprocess_esde_m3u_check, esde_post_subtitle, esde_post_title = add_option_row(
+            "Post-Process Extracted Files for ES-DE .m3u Layout",
+            "Runs ES-DE directory-as-file conversion on extracted folders.",
+            DEFAULT_POSTPROCESS_ESDE_M3U,
+        )
+        self.esde_post_title_label = esde_post_title
+        self.esde_post_subtitle_label = esde_post_subtitle
+        options_layout.addWidget(esde_post_row)
 
         # Download Threads (Option Row)
         threads_row = QtWidgets.QWidget()
@@ -3495,6 +3889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.myrient_edit.editingFinished.connect(lambda: self._validate_field("myrient"))
 
         self.use_igir_check.stateChanged.connect(self._on_use_igir_changed)
+        self.extract_archives_check.stateChanged.connect(self._on_extract_archives_changed)
 
         # Load saved settings BEFORE validation so we validate the loaded values
         self._load_settings()
@@ -3507,6 +3902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_clean_roms_subtitle()
         self._update_igir_options_for_dat()
         self._on_use_igir_changed(self.use_igir_check.checkState())
+        self._on_extract_archives_changed(self.extract_archives_check.checkState())
 
         if USE_FRAMELESS_WINDOWS:
             # Window recovery helpers for frameless mode.
@@ -3704,6 +4100,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.clean_roms_check.setEnabled(False)
             self.clean_title_label.setEnabled(False)
 
+    def _on_extract_archives_changed(self, state: int) -> None:
+        is_checked = state == QtCore.Qt.Checked
+        self.extract_to_subfolder_check.setEnabled(is_checked)
+        self.extract_mode_title_label.setEnabled(is_checked)
+        self.extract_mode_subtitle_label.setEnabled(is_checked)
+        self.delete_archive_after_extract_check.setEnabled(is_checked)
+        self.delete_archive_title_label.setEnabled(is_checked)
+        self.delete_archive_subtitle_label.setEnabled(is_checked)
+        self.postprocess_esde_m3u_check.setEnabled(is_checked)
+        self.esde_post_title_label.setEnabled(is_checked)
+        self.esde_post_subtitle_label.setEnabled(is_checked)
+
     def _browse_dat(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select DAT file", str(Path.cwd()), "DAT files (*.dat);;All files (*)"
@@ -3748,6 +4156,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if url:
             config_snapshot["myrient_base_url"] = url
         config_snapshot["select_downloads"] = self.select_downloads_check.isChecked()
+        config_snapshot["extract_archives"] = self.extract_archives_check.isChecked()
+        config_snapshot["extract_to_subfolder"] = self.extract_to_subfolder_check.isChecked()
+        config_snapshot["delete_archive_after_extract"] = self.delete_archive_after_extract_check.isChecked()
+        config_snapshot["postprocess_esde_m3u"] = self.postprocess_esde_m3u_check.isChecked()
 
         # RetroAchievements DATs always use simple fixdat matching; skip IGIR
         if getattr(self, "_retroachievements_dat", False):
@@ -3810,13 +4222,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     if hasattr(self.worker, "request_stop"):
                         self.worker.request_stop()  # type: ignore[attr-defined]
-                self.worker.requestInterruption()  # Signal interruption first
-                self.stop_button.setText("Force Stopping...")
-                self.log_edit.appendPlainText("🛑 Force stop requested - terminating immediately...")
-
-                # Force immediate cleanup since terminate() might not trigger finished signal
-                QtCore.QTimer.singleShot(100, self._force_cleanup_after_terminate)
-                QtCore.QTimer.singleShot(1000, lambda: self.worker.terminate() if self.worker and self.worker.isRunning() else None)
+                self.worker.requestInterruption()
+                self.stop_button.setText("Finalizing...")
+                self.stop_button.setEnabled(False)
+                self.log_edit.appendPlainText(
+                    "🛑 Force stop requested - cancelling downloads immediately and finalizing extraction/post-process."
+                )
 
     def _start_mcfd_worker(self, config_snapshot: dict, use_igir: bool) -> None:
         if self.worker and self.worker.isRunning():
@@ -3995,7 +4406,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Show a dialog asking for the full Myrient URL when inferred URL returned 404.
         Returns the URL string if user clicks OK, or empty string if cancelled."""
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Myrient URL Not Found (404)")
+        dialog.setWindowTitle("Download URL Not Found (404)")
         dialog.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.Dialog
@@ -4020,7 +4431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         title_layout = QtWidgets.QHBoxLayout(title_bar)
         title_layout.setContentsMargins(10, 4, 8, 4)
         title_layout.setSpacing(8)
-        title_label = QtWidgets.QLabel("Myrient URL Not Found (404)")
+        title_label = QtWidgets.QLabel("Download URL Not Found (404)")
         title_label.setObjectName("titleText")
         title_layout.addWidget(title_label)
         title_layout.addStretch(1)
@@ -4071,17 +4482,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_mcfd_error(self, message: str) -> None:
         self._show_error_dialog("Error", message)
         self.set_status("Error")
-
-    def _force_cleanup_after_terminate(self) -> None:
-        """Force cleanup after terminate() since it might not trigger finished signal properly."""
-        if self.worker and not self.worker.isRunning():
-            self.set_status("Force stopped")  # Override the status
-            self._on_worker_finished()  # Use the standard cleanup
-        elif self.worker:
-            # If still running after timeout, force cleanup anyway
-            self.set_status("Force stopped")
-            self._on_worker_finished()
-        self._cleanup_tmp_files_for_downloads()
 
     def _cleanup_tmp_files_for_downloads(self) -> None:
         """Best-effort cleanup of leftover temp files in downloads directory."""
@@ -4157,6 +4557,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.select_downloads_check.setChecked(
             settings.value(SETTING_SELECT_DOWNLOADS, False, bool)
         )
+        self.extract_archives_check.setChecked(
+            settings.value(SETTING_EXTRACT_ARCHIVES, DEFAULT_EXTRACT_ARCHIVES, bool)
+        )
+        self.extract_to_subfolder_check.setChecked(
+            settings.value(SETTING_EXTRACT_TO_SUBFOLDER, DEFAULT_EXTRACT_TO_SUBFOLDER, bool)
+        )
+        self.delete_archive_after_extract_check.setChecked(
+            settings.value(SETTING_DELETE_ARCHIVE_AFTER_EXTRACT, DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT, bool)
+        )
+        self.postprocess_esde_m3u_check.setChecked(
+            settings.value(SETTING_POSTPROCESS_ESDE_M3U, DEFAULT_POSTPROCESS_ESDE_M3U, bool)
+        )
 
         self.download_threads_spin.setValue(
             settings.value(
@@ -4177,6 +4589,16 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.setValue(SETTING_USE_IGIR, self.use_igir_check.isChecked())
         settings.setValue(SETTING_CLEAN_ROMS, self.clean_roms_check.isChecked())
         settings.setValue(SETTING_SELECT_DOWNLOADS, self.select_downloads_check.isChecked())
+        settings.setValue(SETTING_EXTRACT_ARCHIVES, self.extract_archives_check.isChecked())
+        settings.setValue(SETTING_EXTRACT_TO_SUBFOLDER, self.extract_to_subfolder_check.isChecked())
+        settings.setValue(
+            SETTING_DELETE_ARCHIVE_AFTER_EXTRACT,
+            self.delete_archive_after_extract_check.isChecked(),
+        )
+        settings.setValue(
+            SETTING_POSTPROCESS_ESDE_M3U,
+            self.postprocess_esde_m3u_check.isChecked(),
+        )
 
         settings.setValue(
             SETTING_DOWNLOAD_THREADS,
@@ -4194,6 +4616,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_igir_check.stateChanged.connect(self._on_settings_changed)
         self.clean_roms_check.stateChanged.connect(self._on_settings_changed)
         self.select_downloads_check.stateChanged.connect(self._on_settings_changed)
+        self.extract_archives_check.stateChanged.connect(self._on_settings_changed)
+        self.extract_to_subfolder_check.stateChanged.connect(self._on_settings_changed)
+        self.delete_archive_after_extract_check.stateChanged.connect(self._on_settings_changed)
+        self.postprocess_esde_m3u_check.stateChanged.connect(self._on_settings_changed)
         self.download_threads_spin.valueChanged.connect(self._on_settings_changed)
 
 

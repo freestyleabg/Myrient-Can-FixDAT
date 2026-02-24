@@ -1,0 +1,98 @@
+name: Build and Release ESDE ROM Formatter
+
+on:
+  push:
+    tags:
+      - 'formatter-v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create/Update GitHub Release with built assets"
+        required: false
+        default: false
+        type: boolean
+      release_name:
+        description: "Release name (optional; defaults to tag)"
+        required: false
+        default: ""
+        type: string
+      release_tag:
+        description: "Release tag (optional; defaults to existing tag or auto-generated for manual runs)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt5 pyinstaller
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onefile --windowed --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
+
+      - name: Build app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --windowed --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/ESDE-ROM-Formatter.app dist/ESDE-ROM-Formatter-macos.zip
+
+      - name: Upload Release Asset (Windows)
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')) && runner.os == 'Windows'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-formatter-{0}', github.run_number)) }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-formatter-{0}', github.run_number))) }}
+          files: dist/ESDE-ROM-Formatter.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset (macOS)
+        if: (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')) && runner.os == 'macOS'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-formatter-{0}', github.run_number)) }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('manual-formatter-{0}', github.run_number))) }}
+          files: dist/ESDE-ROM-Formatter-macos.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Artifact (manual Windows)
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESDE-ROM-Formatter-Windows
+          path: dist/ESDE-ROM-Formatter.exe
+
+      - name: Upload Build Artifact (manual macOS)
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESDE-ROM-Formatter-macOS
+          path: dist/ESDE-ROM-Formatter-macos.zip
+
+
+

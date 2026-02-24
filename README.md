@@ -1,12 +1,10 @@
-# 🎮 Myrient Can FixDAT
+# 🎮 Can FixDAT
 
-> ⚠️ **v1.0.0 Disclaimer**  
-> This project started as a personal tool I made for myself and later decided to develop and share. While it works well for my use cases, it may not be free of bugs, edge cases, or unexpected behavior. Use it at your own risk, double-check results, and always keep backups of your data and ROM collections!
-
+**Version: 1.1.0**
 
 A GUI tool that downloads missing ROMs from Myrient to complete your game collection. Point it at your existing ROMs, give it a DAT file describing your desired collection, and it will download only what you're missing. Includes built-in DAT downloaders for daily [Fresh1G1R](https://github.com/UnluckyForSome/Fresh1G1R) 1G1R sets and [RetroAchievements](https://github.com/UltraGodAzgorath/Unofficial-RA-DATs) DATs.
 
-![Myrient Can FixDAT Screenshot](.github/MyrientCanFixDat.PNG)
+![Can FixDAT Screenshot](.github/MyrientCanFixDat.PNG)
 
 ## ✨ Features
 
@@ -19,15 +17,13 @@ A GUI tool that downloads missing ROMs from Myrient to complete your game collec
 
 ### Option 1: Standalone Executable
 
-> ⚠️ As a general rule, you should **never blindly run `.exe` files from GitHub (or anywhere else)**. Only run executables if you trust the source and understand the risks.
-
-For convenience, a prebuilt [`MyrientCanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/MyrientCanFixDAT.exe) is provided in the Releases section. It is **generated directly from this repository's Python source using PyInstaller**, which bundles the app and Python runtime into a single executable.
+For convenience, a prebuilt [`CanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/CanFixDAT.exe) is provided in the Releases section. It is generated directly from this repository's Python source using PyInstaller, which bundles the app and Python runtime into a single executable.
 
 🔍 You can review the source used to build the executable here: [`MyrientCanFixDAT.py`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/blob/main/MyrientCanFixDAT.py).
 
 
 **Steps:**
-1. 📦 Download [`MyrientCanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/MyrientCanFixDAT.exe) from the **Releases** page  
+1. 📦 Download [`CanFixDAT.exe`](https://github.com/UnluckyForSome/Myrient-Can-FixDAT/releases/latest/download/CanFixDAT.exe) from the **Releases** page  
 2. ▶️ Run the `.exe` — required directories will be created alongside it  
 3. ⚙️ Configure your paths and click **Run**
 
@@ -71,7 +67,7 @@ Where newly downloaded ROMs will be saved.
 This can be the same as your ROMs directory or a separate folder if you prefer to stage downloads first.
 
 **🌐 Myrient Base URL**  
-The base URL for Myrient. It's not coded into this repo, you have to add it yourself!  
+Myrient is not hardcoded in the app; you provide your own Myrient base URL here.  
 The system-specific path each set of downloads is automatically determined from the DAT file, so only the base URL is required.
 
 ---
@@ -127,3 +123,50 @@ Click **RetroAchievements** to open a separate dialog that lists DAT files from 
 - [No-Intro](https://no-intro.org/) — Cartridge preservation project
 
 ---
+
+## ESDE ROM Formatter (New)
+
+This repo now includes:
+- `esde_rom_formatter_gui.py` (GUI app)
+- `esde_rom_formatter_core.py` (CLI/core engine)
+
+Which one to run:
+- Use `esde_rom_formatter_gui.py` for normal use (GUI window).
+- Use `esde_rom_formatter_core.py` only if you want command-line usage or scripting.
+
+It handles ES-DE multi-disc setups using the **directories interpreted as files** layout.
+
+What it does:
+- Scans a ROM folder for multi-disc naming patterns like `(Disc 1)`, `(Disk 2)`, `CD1`, etc.
+- Creates a folder named `<Game>.m3u`
+- Moves matching disc files into that folder
+- Creates `<Game>.m3u` playlist inside that folder
+- Prefers `.cue` entries in the playlist when available (best for BIN/CUE sets)
+- Uses extension-agnostic scanning so ES-DE-supported formats (including `.rvz`, `.wbfs`, `.wia`, etc.) are detected without hardcoded per-system lists
+
+Run GUI:
+
+```bash
+python esde_rom_formatter_gui.py
+```
+
+CLI examples:
+
+```bash
+python esde_rom_formatter_core.py "D:\Roms\psx" --recursive --dry-run
+python esde_rom_formatter_core.py "D:\Roms\psx" --recursive
+python esde_rom_formatter_core.py --pick-folder --recursive
+python esde_rom_formatter_core.py "D:\Roms\psx" --extract-archives --postprocess-single-disc --delete-archives
+```
+
+GUI options now include:
+- Extract `.zip/.7z` archives first
+- Delete archives after successful extraction
+- Post-process single-disc folders (e.g. `Game` -> `Game.cue`)
+
+Build as `.exe` (PyInstaller):
+
+```bash
+pip install PyQt5 pyinstaller
+pyinstaller --onefile --windowed --name ESDE-ROM-Formatter esde_rom_formatter_gui.py
+```
