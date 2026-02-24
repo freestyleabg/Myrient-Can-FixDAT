@@ -43,12 +43,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyQt5 requests lxml pyinstaller
+          pip install PyQt5 requests lxml pyinstaller pillow
 
       - name: Build executable (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --windowed --icon .github/icon_white.ico --name CanFixDAT CanFixDAT.py
+          pyinstaller --onefile --windowed --icon .github/icon_white.png --name CanFixDAT CanFixDAT.py
 
       - name: Build app bundle (macOS)
         if: runner.os == 'macOS'
