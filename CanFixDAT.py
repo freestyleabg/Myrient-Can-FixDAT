@@ -17,6 +17,7 @@ from __future__ import annotations
 
 # Standard library imports
 import csv
+import os
 import re
 import shutil
 import subprocess
@@ -69,6 +70,9 @@ SETTING_EXTRACT_ARCHIVES = "extract_archives"
 SETTING_EXTRACT_TO_SUBFOLDER = "extract_to_subfolder"
 SETTING_DELETE_ARCHIVE_AFTER_EXTRACT = "delete_archive_after_extract"
 SETTING_POSTPROCESS_ESDE_M3U = "postprocess_esde_m3u"
+SETTING_CHD_CONVERT = "chd_convert"
+SETTING_CHD_TYPE = "chd_type"
+SETTING_CHD_DELETE_SOURCE = "chd_delete_source"
 
 
 # File and path constants
@@ -97,7 +101,23 @@ DEFAULT_EXTRACT_ARCHIVES = True
 DEFAULT_EXTRACT_TO_SUBFOLDER = True
 DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT = False
 DEFAULT_POSTPROCESS_ESDE_M3U = False
+DEFAULT_CHD_CONVERT = False
+DEFAULT_CHD_TYPE = "cd"
+DEFAULT_CHD_DELETE_SOURCE = False
 ARCHIVE_EXTENSIONS = (".zip", ".7z")
+ROM_LAUNCHER_EXTENSIONS = {
+    ".cue", ".chd", ".iso", ".rvz", ".gdi", ".ccd", ".mds",
+    ".pbp", ".cso", ".wbfs", ".wia", ".img", ".mdf",
+}
+MULTI_DISC_HINT_RE = re.compile(
+    r"""(?ix)
+    (
+        (?:disc|disk|cd|dvd)\s*[\(\[]?\s*(?:\d+|[ivxlcdm]+|[a-d])
+        |
+        \b\d+\s*(?:of|/)\s*\d+\b
+    )
+    """
+)
 
 # UI constants
 WINDOW_DEFAULT_WIDTH = 1200
@@ -169,7 +189,18 @@ def _get_app_directory() -> Path:
         # Running as Python script - use script's directory
         return Path(__file__).parent.resolve()
 
+def _get_app_data_directory(app_dir: Path) -> Path:
+    """Return directory for app-managed data (dat cache, igir, etc.)."""
+    # Keep source runs local to repo; packaged runs use user data dir.
+    if not getattr(sys, "frozen", False):
+        return app_dir
+    if sys.platform.startswith("win"):
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        return base / "CanFixDAT"
+    return Path.home() / ".local" / "share" / "CanFixDAT"
+
 SCRIPT_DIR = _get_app_directory()
+APP_DATA_DIR = _get_app_data_directory(SCRIPT_DIR)
 
 APP_STYLESHEET = """
 QWidget#titleBar {
@@ -451,9 +482,9 @@ def normalize_path_display(path_str: str) -> str:
 
 def get_latest_dat_file() -> str:
     """Get the most recently modified DAT file from dat directory."""
-    dat_cache_dir = SCRIPT_DIR / DAT_CACHE_DIR
+    dat_cache_dir = APP_DATA_DIR / DAT_CACHE_DIR
     if not dat_cache_dir.exists():
-        return normalize_path_display(DEFAULT_DAT_FALLBACK)
+        return normalize_path_display(str(dat_cache_dir / "psx.dat"))
 
     dat_files = list(dat_cache_dir.glob(f"*{DAT_EXTENSION}"))
     if not dat_files:
@@ -465,7 +496,7 @@ def get_latest_dat_file() -> str:
 
 def get_initial_dat_file() -> str:
     """Get initial DAT file path for GUI - returns empty string if no DAT found."""
-    dat_cache_dir = SCRIPT_DIR / DAT_CACHE_DIR
+    dat_cache_dir = APP_DATA_DIR / DAT_CACHE_DIR
     if not dat_cache_dir.exists():
         return ""
 
@@ -487,7 +518,7 @@ def resolve_path(path_str: str) -> Path:
 
     p = Path(path_str).expanduser()
     if not p.is_absolute():
-        p = SCRIPT_DIR / p
+        p = APP_DATA_DIR / p
     return p.resolve()
 
 
@@ -638,7 +669,7 @@ class Config:
         self.roms_directory: str = ""  # Empty by default - user must set
         self.downloads_directory: str = ""  # Empty by default - user must set
         self.myrient_base_url: str = DEFAULT_MYRIENT_URL  # Default Myrient URL (can be changed in GUI)
-        self.igir_exe: str = IGIR_EXE_DEFAULT
+        self.igir_exe: str = normalize_path_display(str(APP_DATA_DIR / "igir" / "igir.exe"))
         self.igir_version_override: str = "4.1.2"
         self.auto_config_yes: bool = True
         self.clean_roms: bool = True
@@ -647,6 +678,9 @@ class Config:
         self.extract_to_subfolder: bool = DEFAULT_EXTRACT_TO_SUBFOLDER
         self.delete_archive_after_extract: bool = DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT
         self.postprocess_esde_m3u: bool = DEFAULT_POSTPROCESS_ESDE_M3U
+        self.chd_convert: bool = DEFAULT_CHD_CONVERT
+        self.chd_type: str = DEFAULT_CHD_TYPE
+        self.chd_delete_source: bool = DEFAULT_CHD_DELETE_SOURCE
 
 
     def to_dict(self) -> Dict[str, object]:
@@ -666,6 +700,9 @@ class Config:
             "extract_to_subfolder": self.extract_to_subfolder,
             "delete_archive_after_extract": self.delete_archive_after_extract,
             "postprocess_esde_m3u": self.postprocess_esde_m3u,
+            "chd_convert": self.chd_convert,
+            "chd_type": self.chd_type,
+            "chd_delete_source": self.chd_delete_source,
         }
 
     def update_from_dict(self, data: Dict[str, object]) -> None:
@@ -843,10 +880,12 @@ def download_file(
 
 def check_fixdat_setup() -> Tuple[bool, Optional[Path]]:
     """Check for manual fixdat file in script directory."""
-    fixdat_path = SCRIPT_DIR / FIXDAT_FILE
-    if fixdat_path.exists():
-        print(f"📄 Found manual fixdat: {fixdat_path}")
-        return True, fixdat_path
+    # New location for packaged app + legacy location for compatibility.
+    for base in (APP_DATA_DIR, SCRIPT_DIR):
+        fixdat_path = base / FIXDAT_FILE
+        if fixdat_path.exists():
+            print(f"📄 Found manual fixdat: {fixdat_path}")
+            return True, fixdat_path
     return False, None
 
 
@@ -2367,6 +2406,64 @@ class DownloadWorker(QtCore.QThread):
                 return exe
         return None
 
+    def _is_likely_multi_disc_archive(self, archive_path: Path) -> bool:
+        """Heuristic for archive names that likely represent multi-disc content."""
+        stem = archive_path.stem
+        stem_path = Path(stem)
+        base_name = stem_path.stem if stem_path.suffix.lower() in ROM_LAUNCHER_EXTENSIONS else stem
+        return bool(MULTI_DISC_HINT_RE.search(base_name))
+
+    def _derive_extract_subfolder_name(
+        self,
+        archive_path: Path,
+        keep_launcher_suffix: bool = False,
+        keep_suffix_multi_only: bool = False,
+    ) -> str:
+        """
+        Derive a clean extraction folder name.
+
+        For archives named like `Game.cue.zip`, strip the inner launcher suffix so
+        the folder becomes `Game` instead of `Game.cue`.
+        """
+        stem = archive_path.stem
+        if keep_launcher_suffix:
+            if keep_suffix_multi_only and not self._is_likely_multi_disc_archive(archive_path):
+                stem_path = Path(stem)
+                if stem_path.suffix.lower() in ROM_LAUNCHER_EXTENSIONS:
+                    return stem_path.stem
+            return stem
+        stem_path = Path(stem)
+        if stem_path.suffix.lower() in ROM_LAUNCHER_EXTENSIONS:
+            return stem_path.stem
+        return stem
+
+    def _find_chdman_executable(self) -> Optional[str]:
+        """Return a chdman executable path if available."""
+        search_dirs: List[Path] = []
+        if getattr(sys, "frozen", False):
+            search_dirs.append(Path(sys.executable).resolve().parent)
+        search_dirs.extend(
+            [
+                SCRIPT_DIR,
+                APP_DATA_DIR,
+                APP_DATA_DIR / "tools",
+                APP_DATA_DIR / "chdman",
+            ]
+        )
+        names = ["chdman.exe", "chdman"] if os.name == "nt" else ["chdman"]
+
+        for base in search_dirs:
+            for name in names:
+                candidate = base / name
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+
+        for candidate in ("chdman", "chdman.exe"):
+            exe = shutil.which(candidate)
+            if exe:
+                return exe
+        return None
+
     def _flatten_single_new_nested_dir(self, output_dir: Path, pre_names: set[str]) -> Tuple[bool, str, int]:
         """Flatten one newly-created top-level directory into output_dir when safe."""
         try:
@@ -2404,6 +2501,8 @@ class DownloadWorker(QtCore.QThread):
         archive_path: Path,
         extract_to_subfolder: bool,
         delete_archive_after_extract: bool,
+        keep_launcher_suffix: bool = False,
+        keep_suffix_multi_only: bool = False,
     ) -> Tuple[bool, str, int]:
         """Extract .zip/.7z archive into a sibling folder named after the archive stem."""
         suffix = archive_path.suffix.lower()
@@ -2412,7 +2511,16 @@ class DownloadWorker(QtCore.QThread):
         if not archive_path.exists():
             return False, f"Archive not found: {archive_path.name}", 0
 
-        output_dir = archive_path.parent / archive_path.stem if extract_to_subfolder else archive_path.parent
+        output_dir = (
+            archive_path.parent
+            / self._derive_extract_subfolder_name(
+                archive_path,
+                keep_launcher_suffix,
+                keep_suffix_multi_only,
+            )
+            if extract_to_subfolder
+            else archive_path.parent
+        )
         target_label = output_dir.name if extract_to_subfolder else "."
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2499,48 +2607,6 @@ class DownloadWorker(QtCore.QThread):
             def debug(self, message: str) -> None:
                 return
 
-        def maybe_suffix_single_disc_folder(folder: Path) -> Path:
-            """For extracted single-disc folders, suffix folder with launcher extension (prefer .cue)."""
-            if not folder.exists() or not folder.is_dir() or folder.suffix:
-                return folder
-            try:
-                entries = list(folder.iterdir())
-            except OSError:
-                return folder
-
-            top_files = [p for p in entries if p.is_file()]
-            if not top_files:
-                return folder
-
-            launch_exts = {
-                ".cue", ".chd", ".iso", ".rvz", ".gdi", ".ccd", ".mds",
-                ".pbp", ".cso", ".wbfs", ".wia", ".img", ".mdf",
-            }
-            launchers = [p for p in top_files if p.suffix.lower() in launch_exts]
-            cues = [p for p in launchers if p.suffix.lower() == ".cue"]
-
-            target_name = ""
-            if len(cues) == 1:
-                target_name = cues[0].name
-            elif len(launchers) == 1:
-                target_name = launchers[0].name
-            else:
-                return folder
-
-            target = folder.with_name(target_name)
-            if target.exists():
-                self.log_signal.emit(
-                    f"⚠️  ES-DE post-process: cannot rename '{folder.name}' to '{target.name}' (already exists)"
-                )
-                return folder
-            try:
-                folder.rename(target)
-                self.log_signal.emit(f"🧩 ES-DE post-process: renamed '{folder.name}' -> '{target.name}'")
-                return target
-            except OSError as e:
-                self.log_signal.emit(f"⚠️  ES-DE post-process: rename failed for '{folder.name}': {e}")
-                return folder
-
         logger = _GuiLogger(self.log_signal)
         unique_roots = sorted({p.resolve() for p in roots if p.exists() and p.is_dir()}, key=lambda p: str(p).lower())
         if not unique_roots:
@@ -2550,21 +2616,6 @@ class DownloadWorker(QtCore.QThread):
         moved_total = 0
         skipped_total = 0
         for root in unique_roots:
-            root = maybe_suffix_single_disc_folder(root)
-            if not root.exists() or not root.is_dir():
-                continue
-
-            # Also normalize single-disc subfolders so this works even when extraction target is a parent directory.
-            try:
-                subdirs = [p for p in root.rglob("*") if p.is_dir()]
-            except OSError:
-                subdirs = []
-            # Deepest-first avoids path invalidation when renaming nested folders.
-            for subdir in sorted(subdirs, key=lambda p: len(p.parts), reverse=True):
-                if subdir.name.lower().endswith(".m3u"):
-                    continue
-                maybe_suffix_single_disc_folder(subdir)
-
             self.log_signal.emit(f"🧩 ES-DE post-process scan: {normalize_path_display(str(root))}")
             plans = esde_build_plans(root, recursive=True, logger=logger)
             if not plans:
@@ -2575,6 +2626,138 @@ class DownloadWorker(QtCore.QThread):
                 moved_total += moved
                 skipped_total += skipped
         return groups_total, moved_total, skipped_total
+
+    def _run_chd_conversion(
+        self,
+        roots: List[Path],
+        chd_type: str,
+        delete_source_after_convert: bool = False,
+    ) -> Tuple[int, int, int, int]:
+        """Convert extracted disc images to CHD format using chdman."""
+        exe = self._find_chdman_executable()
+        if not exe:
+            self.log_signal.emit("⚠️  CHD conversion requested, but chdman was not found (app folder or PATH).")
+            return 0, 0, 0, 0
+
+        normalized_type = (chd_type or DEFAULT_CHD_TYPE).strip().lower()
+        if normalized_type not in {"cd", "dvd"}:
+            normalized_type = DEFAULT_CHD_TYPE
+
+        # Keep CD/DVD selection as ISO command preference, with fallback for compatibility.
+        iso_cmd_order = ["createdvd", "createcd"] if normalized_type == "dvd" else ["createcd", "createdvd"]
+        input_exts = {".cue", ".gdi", ".iso"}
+
+        converted = 0
+        failed = 0
+        skipped = 0
+        source_deleted = 0
+        stop_after_current = False
+
+        unique_roots = sorted({p.resolve() for p in roots if p.exists() and p.is_dir()}, key=lambda p: str(p).lower())
+        if not unique_roots:
+            return 0, 0, 0, 0
+
+        def _cleanup_partial_output(path: Path) -> None:
+            try:
+                if path.exists():
+                    path.unlink()
+                    self.log_signal.emit(f"🧹 Removed incomplete CHD: {path.name}")
+            except OSError as e:
+                self.log_signal.emit(f"⚠️  Could not remove incomplete CHD {path.name}: {e}")
+
+        for root in unique_roots:
+            try:
+                candidates = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in input_exts]
+            except OSError as e:
+                self.log_signal.emit(f"⚠️  CHD scan failed in {normalize_path_display(str(root))}: {e}")
+                failed += 1
+                continue
+
+            for source_file in candidates:
+                if self._stop_requested or self.isInterruptionRequested():
+                    stop_after_current = True
+                    break
+
+                output_file = source_file.with_suffix(".chd")
+                if output_file.exists():
+                    skipped += 1
+                    continue
+
+                ext = source_file.suffix.lower()
+                if ext in {".cue", ".gdi"}:
+                    cmd_order = ["createcd"]
+                elif ext == ".iso":
+                    cmd_order = iso_cmd_order
+                else:
+                    continue
+
+                last_error = "unknown chdman error"
+                converted_this_file = False
+                for idx, mode_cmd in enumerate(cmd_order):
+                    # Ensure failed fallback attempts do not leave output that blocks next attempt.
+                    _cleanup_partial_output(output_file)
+                    try:
+                        proc = subprocess.Popen(  # noqa: S603
+                            [exe, mode_cmd, "-i", str(source_file), "-o", str(output_file)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                    except OSError as e:
+                        last_error = str(e)
+                        _cleanup_partial_output(output_file)
+                        continue
+
+                    stdout = ""
+                    stderr = ""
+                    while True:
+                        try:
+                            stdout, stderr = proc.communicate(timeout=0.2)
+                            break
+                        except subprocess.TimeoutExpired:
+                            if self._force_stop_requested or self.isInterruptionRequested():
+                                proc.kill()
+                                stdout, stderr = proc.communicate()
+                                last_error = "stopped by user"
+                                _cleanup_partial_output(output_file)
+                                stop_after_current = True
+                                break
+
+                    if stop_after_current and last_error == "stopped by user":
+                        break
+
+                    if proc.returncode == 0 and output_file.exists():
+                        converted += 1
+                        if delete_source_after_convert:
+                            try:
+                                source_file.unlink()
+                                source_deleted += 1
+                                self.log_signal.emit(f"🗑️  CHD source deleted: {source_file.name}")
+                            except OSError as e:
+                                self.log_signal.emit(f"⚠️  Could not delete CHD source {source_file.name}: {e}")
+                        if idx > 0 and ext == ".iso":
+                            self.log_signal.emit(
+                                f"💿 CHD converted with fallback ({mode_cmd}): {source_file.name} -> {output_file.name}"
+                            )
+                        else:
+                            self.log_signal.emit(f"💿 CHD converted: {source_file.name} -> {output_file.name}")
+                        converted_this_file = True
+                        break
+
+                    last_error = (stderr or "").strip() or (stdout or "").strip() or "unknown chdman error"
+                    _cleanup_partial_output(output_file)
+
+                if not converted_this_file:
+                    failed += 1
+                    self.log_signal.emit(f"⚠️  CHD conversion failed for {source_file.name}: {last_error.splitlines()[0]}")
+                    if stop_after_current and last_error == "stopped by user":
+                        break
+
+            if stop_after_current:
+                self.log_signal.emit("🛑 Stop requested - skipped remaining CHD conversions.")
+                break
+
+        return converted, failed, skipped, source_deleted
 
     def _emit_log_lines(self, text: str) -> None:
         if not text:
@@ -2858,6 +3041,14 @@ class DownloadWorker(QtCore.QThread):
             self._config.get("delete_archive_after_extract", DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT)
         )
         postprocess_esde_m3u = bool(self._config.get("postprocess_esde_m3u", DEFAULT_POSTPROCESS_ESDE_M3U))
+        chd_convert = bool(self._config.get("chd_convert", DEFAULT_CHD_CONVERT))
+        chd_type = str(self._config.get("chd_type", DEFAULT_CHD_TYPE) or DEFAULT_CHD_TYPE).strip().lower()
+        chd_delete_source = bool(self._config.get("chd_delete_source", DEFAULT_CHD_DELETE_SOURCE))
+        if chd_type not in {"cd", "dvd"}:
+            chd_type = DEFAULT_CHD_TYPE
+        # ES-DE directory-as-file mode: keep launcher suffixes for likely multi-disc sets only.
+        keep_launcher_suffix = postprocess_esde_m3u
+        keep_suffix_multi_only = postprocess_esde_m3u
         extract_workers = max(1, min(4, max_workers))
 
         self.log_signal.emit(f"📥 Downloading {total_games:,} games ({format_size(total_size)})")
@@ -2869,6 +3060,10 @@ class DownloadWorker(QtCore.QThread):
             )
             if delete_archive_after_extract:
                 self.log_signal.emit("🗑️  Archive cleanup enabled: delete archive after successful extraction")
+            if chd_convert:
+                self.log_signal.emit(f"💿 CHD conversion enabled: mode '{chd_type}'")
+                if chd_delete_source:
+                    self.log_signal.emit("🗑️  CHD cleanup enabled: delete source file after successful conversion")
             if postprocess_esde_m3u:
                 self.log_signal.emit("🧩 ES-DE post-process enabled for extracted folders")
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -2877,6 +3072,10 @@ class DownloadWorker(QtCore.QThread):
         failed = 0
         extracted_ok = 0
         extracted_failed = 0
+        chd_converted = 0
+        chd_failed = 0
+        chd_skipped = 0
+        chd_source_deleted = 0
         extract_futures: Dict[object, Path] = {}
         postprocess_roots: set[Path] = set()
 
@@ -2898,35 +3097,43 @@ class DownloadWorker(QtCore.QThread):
 
             parent = archive_path.parent
             stem = archive_path.stem
+            derived_stem = self._derive_extract_subfolder_name(
+                archive_path,
+                keep_launcher_suffix,
+                keep_suffix_multi_only,
+            )
 
             # Default extraction target before optional ES-DE rename.
-            direct_target = parent / stem
-            try:
-                if direct_target.exists() and direct_target.is_dir() and any(direct_target.iterdir()):
-                    return True
-            except OSError:
-                pass
+            for candidate_stem in {stem, derived_stem}:
+                direct_target = parent / candidate_stem
+                try:
+                    if direct_target.exists() and direct_target.is_dir() and any(direct_target.iterdir()):
+                        return True
+                except OSError:
+                    pass
 
             # ES-DE post-process may rename folder to launcher extension, e.g. "Game.cue".
-            try:
-                for candidate in parent.glob(f"{stem}.*"):
-                    if candidate == archive_path:
-                        continue
-                    if candidate.is_dir():
-                        return True
-            except OSError:
-                pass
-
-            # Flat extraction mode can leave files directly in parent.
-            if not extract_to_subfolder:
+            for candidate_stem in {stem, derived_stem}:
                 try:
-                    for candidate in parent.glob(f"{stem}.*"):
+                    for candidate in parent.glob(f"{candidate_stem}.*"):
                         if candidate == archive_path:
                             continue
-                        if candidate.exists():
+                        if candidate.is_dir():
                             return True
                 except OSError:
                     pass
+
+            # Flat extraction mode can leave files directly in parent.
+            if not extract_to_subfolder:
+                for candidate_stem in {stem, derived_stem}:
+                    try:
+                        for candidate in parent.glob(f"{candidate_stem}.*"):
+                            if candidate == archive_path:
+                                continue
+                            if candidate.exists():
+                                return True
+                    except OSError:
+                        pass
 
             return False
 
@@ -3233,12 +3440,22 @@ class DownloadWorker(QtCore.QThread):
                                 )
                                 if extract_executor and archive_paths:
                                     for archive_path in archive_paths:
-                                        target_dir = archive_path.parent / archive_path.stem if extract_to_subfolder else archive_path.parent
+                                        target_dir = (
+                                            archive_path.parent / self._derive_extract_subfolder_name(
+                                                archive_path,
+                                                keep_launcher_suffix,
+                                                keep_suffix_multi_only,
+                                            )
+                                            if extract_to_subfolder
+                                            else archive_path.parent
+                                        )
                                         ef = extract_executor.submit(
                                             self._extract_archive,
                                             archive_path,
                                             extract_to_subfolder,
                                             delete_archive_after_extract,
+                                            keep_launcher_suffix,
+                                            keep_suffix_multi_only,
                                         )
                                         extract_futures[ef] = target_dir
                         else:
@@ -3286,6 +3503,19 @@ class DownloadWorker(QtCore.QThread):
         if extract_executor:
             extract_executor.shutdown(wait=False, cancel_futures=False)
 
+        if extract_enabled and chd_convert:
+            chd_roots = list(postprocess_roots) if postprocess_roots else [download_dir]
+            chd_converted, chd_failed, chd_skipped, chd_source_deleted = self._run_chd_conversion(
+                chd_roots,
+                chd_type,
+                delete_source_after_convert=chd_delete_source,
+            )
+            self.log_signal.emit(
+                f"💿 CHD conversion complete: converted {chd_converted:,}, failed {chd_failed:,}, skipped {chd_skipped:,}"
+            )
+            if chd_delete_source:
+                self.log_signal.emit(f"🗑️  CHD sources deleted: {chd_source_deleted:,}")
+
         if extract_enabled and postprocess_esde_m3u and postprocess_roots:
             groups, moved, skipped = self._run_esde_postprocess(list(postprocess_roots))
             if groups > 0:
@@ -3320,6 +3550,12 @@ class DownloadWorker(QtCore.QThread):
         if extract_enabled:
             self.log_signal.emit(f"   📂 Extracted: {extracted_ok:,}")
             self.log_signal.emit(f"   ⚠️  Extraction issues: {extracted_failed:,}")
+            if chd_convert:
+                self.log_signal.emit(f"   💿 CHD converted: {chd_converted:,}")
+                self.log_signal.emit(f"   ⚠️  CHD conversion issues: {chd_failed:,}")
+                self.log_signal.emit(f"   ⏭️  CHD skipped (already exists): {chd_skipped:,}")
+                if chd_delete_source:
+                    self.log_signal.emit(f"   🗑️  CHD sources deleted: {chd_source_deleted:,}")
         self.log_signal.emit(f"   ⏱️  Time elapsed: {format_time(total_elapsed)}")
         self.log_signal.emit(f"   🚀 Average speed: {format_speed(avg_rate)}")
         self.log_signal.emit("=" * 70)
@@ -3661,6 +3897,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.esde_post_title_label = esde_post_title
         self.esde_post_subtitle_label = esde_post_subtitle
 
+        chd_row, self.chd_convert_check, chd_subtitle, chd_title = add_option_row(
+            "Convert Extracted Disc Files to CHD (requires chdman in PATH)",
+            "Uses chdman createcd/createdvd on extracted files.",
+            DEFAULT_CHD_CONVERT,
+        )
+        self.chd_title_label = chd_title
+        self.chd_subtitle_label = chd_subtitle
+
+        chd_type_row = QtWidgets.QWidget()
+        chd_type_layout = QtWidgets.QHBoxLayout(chd_type_row)
+        chd_type_layout.setContentsMargins(24, 0, 0, 0)
+        chd_type_layout.setSpacing(6)
+
+        chd_type_text = QtWidgets.QLabel("CHD Mode")
+        chd_type_text.setStyleSheet("color: gray; font-size: 10px;")
+        self.chd_type_label = chd_type_text
+
+        self.chd_type_combo = QtWidgets.QComboBox()
+        self.chd_type_combo.addItem("CD", "cd")
+        self.chd_type_combo.addItem("DVD", "dvd")
+        self.chd_type_combo.setCurrentIndex(0)
+        self.chd_type_combo.setFixedWidth(90)
+
+        chd_type_layout.addWidget(chd_type_text, alignment=QtCore.Qt.AlignVCenter)
+        chd_type_layout.addWidget(self.chd_type_combo, alignment=QtCore.Qt.AlignVCenter)
+        chd_type_layout.addStretch()
+
+        chd_delete_row, self.chd_delete_source_check, chd_delete_subtitle, chd_delete_title = add_option_row(
+            "Delete CHD Source File After Successful Conversion",
+            "Deletes only the CHD input file (for example .iso/.cue/.gdi) after CHD is created.",
+            DEFAULT_CHD_DELETE_SOURCE,
+        )
+        self.chd_delete_title_label = chd_delete_title
+        self.chd_delete_subtitle_label = chd_delete_subtitle
+
         # Download Threads (Option Row)
         threads_row = QtWidgets.QWidget()
         threads_row.setLayoutDirection(QtCore.Qt.LeftToRight)
@@ -3697,6 +3968,9 @@ class MainWindow(QtWidgets.QMainWindow):
         options_layout.addWidget(extract_row)
         options_layout.addWidget(extract_mode_row)
         options_layout.addWidget(delete_archive_row)
+        options_layout.addWidget(chd_row)
+        options_layout.addWidget(chd_type_row)
+        options_layout.addWidget(chd_delete_row)
         options_layout.addWidget(esde_post_row)
 
         self.download_threads_spin = threads_spin
@@ -3918,6 +4192,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.use_igir_check.stateChanged.connect(self._on_use_igir_changed)
         self.extract_archives_check.stateChanged.connect(self._on_extract_archives_changed)
+        self.chd_convert_check.stateChanged.connect(self._on_chd_convert_changed)
 
         # Load saved settings BEFORE validation so we validate the loaded values
         self._load_settings()
@@ -3931,6 +4206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_igir_options_for_dat()
         self._on_use_igir_changed(self.use_igir_check.checkState())
         self._on_extract_archives_changed(self.extract_archives_check.checkState())
+        self._on_chd_convert_changed(self.chd_convert_check.checkState())
 
         if USE_FRAMELESS_WINDOWS:
             # Window recovery helpers for frameless mode.
@@ -4150,6 +4426,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.postprocess_esde_m3u_check.setEnabled(is_checked)
         self.esde_post_title_label.setEnabled(is_checked)
         self.esde_post_subtitle_label.setEnabled(is_checked)
+        self.chd_convert_check.setEnabled(is_checked)
+        self.chd_title_label.setEnabled(is_checked)
+        self.chd_subtitle_label.setEnabled(is_checked)
+        self._on_chd_convert_changed(self.chd_convert_check.checkState())
+
+    def _on_chd_convert_changed(self, state: int) -> None:
+        can_enable = self.extract_archives_check.isChecked() and state == QtCore.Qt.Checked
+        self.chd_type_combo.setEnabled(can_enable)
+        self.chd_type_label.setEnabled(can_enable)
+        self.chd_delete_source_check.setEnabled(can_enable)
+        self.chd_delete_title_label.setEnabled(can_enable)
+        self.chd_delete_subtitle_label.setEnabled(can_enable)
 
     def _browse_dat(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -4198,6 +4486,9 @@ class MainWindow(QtWidgets.QMainWindow):
         config_snapshot["extract_archives"] = self.extract_archives_check.isChecked()
         config_snapshot["extract_to_subfolder"] = self.extract_to_subfolder_check.isChecked()
         config_snapshot["delete_archive_after_extract"] = self.delete_archive_after_extract_check.isChecked()
+        config_snapshot["chd_convert"] = self.chd_convert_check.isChecked()
+        config_snapshot["chd_type"] = str(self.chd_type_combo.currentData() or DEFAULT_CHD_TYPE)
+        config_snapshot["chd_delete_source"] = self.chd_delete_source_check.isChecked()
         config_snapshot["postprocess_esde_m3u"] = self.postprocess_esde_m3u_check.isChecked()
 
         # RetroAchievements DATs always use simple fixdat matching; skip IGIR
@@ -4605,6 +4896,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.delete_archive_after_extract_check.setChecked(
             settings.value(SETTING_DELETE_ARCHIVE_AFTER_EXTRACT, DEFAULT_DELETE_ARCHIVE_AFTER_EXTRACT, bool)
         )
+        self.chd_convert_check.setChecked(
+            settings.value(SETTING_CHD_CONVERT, DEFAULT_CHD_CONVERT, bool)
+        )
+        chd_type_setting = str(settings.value(SETTING_CHD_TYPE, DEFAULT_CHD_TYPE, str) or DEFAULT_CHD_TYPE).lower()
+        chd_index = self.chd_type_combo.findData(chd_type_setting)
+        self.chd_type_combo.setCurrentIndex(chd_index if chd_index >= 0 else 0)
+        self.chd_delete_source_check.setChecked(
+            settings.value(SETTING_CHD_DELETE_SOURCE, DEFAULT_CHD_DELETE_SOURCE, bool)
+        )
         self.postprocess_esde_m3u_check.setChecked(
             settings.value(SETTING_POSTPROCESS_ESDE_M3U, DEFAULT_POSTPROCESS_ESDE_M3U, bool)
         )
@@ -4635,6 +4935,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.delete_archive_after_extract_check.isChecked(),
         )
         settings.setValue(
+            SETTING_CHD_CONVERT,
+            self.chd_convert_check.isChecked(),
+        )
+        settings.setValue(
+            SETTING_CHD_TYPE,
+            str(self.chd_type_combo.currentData() or DEFAULT_CHD_TYPE),
+        )
+        settings.setValue(
+            SETTING_CHD_DELETE_SOURCE,
+            self.chd_delete_source_check.isChecked(),
+        )
+        settings.setValue(
             SETTING_POSTPROCESS_ESDE_M3U,
             self.postprocess_esde_m3u_check.isChecked(),
         )
@@ -4658,6 +4970,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.extract_archives_check.stateChanged.connect(self._on_settings_changed)
         self.extract_to_subfolder_check.stateChanged.connect(self._on_settings_changed)
         self.delete_archive_after_extract_check.stateChanged.connect(self._on_settings_changed)
+        self.chd_convert_check.stateChanged.connect(self._on_settings_changed)
+        self.chd_type_combo.currentIndexChanged.connect(self._on_settings_changed)
+        self.chd_delete_source_check.stateChanged.connect(self._on_settings_changed)
         self.postprocess_esde_m3u_check.stateChanged.connect(self._on_settings_changed)
         self.download_threads_spin.valueChanged.connect(self._on_settings_changed)
 
@@ -4691,6 +5006,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     for tmp in dpath.glob("*.tmp"):
                         try:
                             tmp.unlink()
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+        # For packaged builds, clear auto-downloaded DAT cache on exit to avoid leftovers.
+        if getattr(sys, "frozen", False):
+            try:
+                dat_cache_dir = APP_DATA_DIR / DAT_CACHE_DIR
+                if dat_cache_dir.exists() and dat_cache_dir.is_dir():
+                    for dat_file in dat_cache_dir.glob("*.dat"):
+                        try:
+                            dat_file.unlink()
                         except OSError:
                             pass
             except OSError:
@@ -5008,7 +5336,7 @@ class DatDownloadDialog(QtWidgets.QDialog):
             return
 
         try:
-            cache_dir = SCRIPT_DIR / DAT_CACHE_DIR
+            cache_dir = APP_DATA_DIR / DAT_CACHE_DIR
             cache_dir.mkdir(exist_ok=True)
             output_path = cache_dir / filename
 

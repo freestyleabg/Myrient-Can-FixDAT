@@ -45,6 +45,7 @@ fixdat_temp.dat
 pyproject.toml
 uv.lock
 Myrient-Can-FixDAT/
+chdman.exe
 
 # PyInstaller artifacts
 *.manifest
