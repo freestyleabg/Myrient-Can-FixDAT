@@ -5038,6 +5038,9 @@ class DatDownloadDialog(QtWidgets.QDialog):
 
 def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
+    app_icon_path = SCRIPT_DIR / ".github" / "icon_white.png"
+    if app_icon_path.exists():
+        app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
 
     # Palette for native dialogs / overall app
     palette = app.palette()
@@ -5060,6 +5063,8 @@ def main() -> None:
     app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow()
+    if app_icon_path.exists():
+        window.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window.show()
     sys.exit(app.exec_())
 

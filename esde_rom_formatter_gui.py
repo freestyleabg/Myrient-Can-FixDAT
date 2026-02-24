@@ -380,7 +380,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
+    app_icon_path = Path(__file__).resolve().parent / ".github" / "icon_white.png"
+    if app_icon_path.exists():
+        app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window = MainWindow()
+    if app_icon_path.exists():
+        window.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
     window.show()
     return app.exec_()
 
